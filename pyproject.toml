@@ -1,6 +1,6 @@
 [project]
 name = "gek"
-version = "0.1.1"
+version = "0.1.2"
 description = "An asynchronous swarm harness: an LLM orchestrator spawns role-based agents that coordinate through a git repo."
 readme = "README.md"
 license = "MIT"

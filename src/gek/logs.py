@@ -85,8 +85,76 @@ def _short(v: Any, n: int = 300) -> str:
     return s if len(s) <= n else s[:n] + f"...(+{len(s) - n} chars)"
 
 
+def _clip(s: Any, n: int = 140) -> str:
+    s = str(s or "").strip().replace("\r", "").split("\n")[0]
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
+    """The curated console feed: what a human watching wants. None = file-only.
+    Plain ASCII on purpose (Windows consoles and cp1252 don't love emoji)."""
+    if kind == "run_start":
+        return f"== run started. goal: {_clip(d.get('goal'), 200)}"
+    if kind == "run_end":
+        return (f"== run ended ({d.get('reason')}). wakes={d.get('wakes')} agents={d.get('agents')} "
+                f"tokens={d.get('tokens')} cost=${d.get('cost', 0):.4f}")
+    if kind == "orch_wake":
+        return f"[orchestrator] wakes (#{d.get('n')}): {', '.join(d.get('reasons') or [])}"
+    if kind == "orch_sleep":
+        return f"[orchestrator] sleeps {d.get('seconds')}s: {_clip(d.get('reason'))}"
+    if kind == "role_written":
+        r = d.get("role") or {}
+        p = r.get("powers") or {}
+        pw = [k for k in ("shell", "merge", "interrupt") if p.get(k)]
+        if p.get("kill"):
+            pw.append("kill:" + ",".join(p["kill"]))
+        if p.get("mcp"):
+            pw.append("mcp:" + ",".join(p["mcp"]))
+        return f"  + role {r.get('name')} ({d.get('verb')}) powers=[{' '.join(pw) or 'none'}]: {_clip(r.get('mandate'), 100)}"
+    if kind == "role_rejected":
+        name = (d.get("role") or {}).get("name")
+        return f"  x role {name} rejected: {_clip('; '.join(d.get('errors') or []), 160)}"
+    if kind == "role_retired":
+        return f"  - role {d.get('role')} retired: {_clip(d.get('reason'))}"
+    if kind == "agent_spawn":
+        return f"  -> {d.get('id')} spawned" + (f": {_clip(d.get('note'), 110)}" if d.get("note") else "")
+    if kind == "agent_exit":
+        lost = d.get("uncommitted_lost") or []
+        extra = f" (lost {len(lost)} uncommitted files)" if lost else ""
+        return f"  <- {actor} {d.get('how')} after {d.get('steps')} steps{extra}: {_clip(d.get('summary'), 120)}"
+    if kind == "agent_kill":
+        return f"  XX {actor} killed {d.get('target')}: {_clip(d.get('reason'))}"
+    if kind == "merge":
+        if d.get("ok"):
+            return f"  >> {actor} merged {d.get('branch')} into main: {d.get('result')}"
+        return f"  !! {actor} hit conflicts merging {d.get('branch')}"
+    if kind == "commit" and not str(d.get("ref", "")).startswith("swarm/"):
+        return f"  *  {actor} committed on {d.get('ref')}: {_clip(d.get('message'), 100)}"
+    if kind == "tool_call" and d.get("name") in ("post", "interrupt"):
+        tag = "says" if d.get("name") == "post" else "interrupts"
+        return f"  ~  {actor} {tag}: {_clip((d.get('args') or {}).get('message'), 150)}"
+    if kind == "inbox" and d.get("external"):
+        return f"  @  inbox from {actor}: {_clip(d.get('message'), 150)}"
+    if kind == "llm_error":
+        return f"  !  {actor} model error: {_clip(d.get('error'), 180)}"
+    if kind == "note" and d.get("error"):
+        return f"  !  {actor}: {_clip(d.get('error'), 180)}"
+    if kind == "note" and d.get("model_rewritten"):
+        m = d["model_rewritten"]
+        return f"  i  model {m.get('from')} -> {m.get('to')}"
+    if kind == "mcp" and not d.get("ok") and not d.get("closing"):
+        return f"  !  {actor} MCP {d.get('server')} failed: {_clip(d.get('error'), 150)}"
+    if kind == "budget":
+        if d.get("exhausted"):
+            return f"  $  token budget spent: {_clip(d.get('detail'))}"
+        return f"  $  {d.get('total_tokens')} tokens so far (cap {d.get('cap') or 'none'})"
+    return None
+
+
 class RunLog:
-    def __init__(self, logs_dir: Path, run_id: str | None = None, echo: bool = True):
+    """echo: "feed" (curated console lines, default), "all" (every event), or "none"."""
+
+    def __init__(self, logs_dir: Path, run_id: str | None = None, echo: str | bool = "feed"):
         logs_dir.mkdir(parents=True, exist_ok=True)
         readme = logs_dir / "README.txt"
         if not readme.exists():
@@ -104,7 +172,7 @@ class RunLog:
         self._agent_files: dict[str, Any] = {}
         self._seq = 0
         self._lock = threading.Lock()
-        self.echo = echo
+        self.echo = {True: "feed", False: "none"}.get(echo, echo) if isinstance(echo, bool) else echo
 
     def write_meta(self, meta: dict[str, Any]) -> None:
         with open(self.dir / "meta.json", "w", encoding="utf-8") as f:
@@ -121,9 +189,16 @@ class RunLog:
             line = f"{ts} #{self._seq:<5} {kind:<13} {actor:<22} {_short(data)}"
             self._text.write(line + "\n")
             self._text.flush()
-        if self.echo and kind not in ("git", "llm_request"):
+        if self.echo == "all":
             print(line[11:23] + " " + f"{kind:<13} {actor:<22} {_short(data, 160)}",
                   file=sys.stderr, flush=True)
+        elif self.echo == "feed":
+            try:
+                fl = feed_line(kind, actor, data)
+            except Exception:
+                fl = None
+            if fl:
+                print(f"{ts[11:19]} {fl}", flush=True)
 
     def transcript(self, actor: str, message: dict[str, Any]) -> None:
         """Append one conversation message for an actor, exactly once."""
@@ -136,6 +211,13 @@ class RunLog:
                 self._agent_files[actor] = f
             f.write(json.dumps({"ts": ts, "t": t, **message}, ensure_ascii=False, default=str) + "\n")
             f.flush()
+
+    def stderr_file(self, name: str):
+        """A file for a subprocess's stderr (MCP servers), so it never hits the console."""
+        f = open(self.dir / f"{name.replace('/', '__')}.stderr.log", "a", encoding="utf-8")
+        with self._lock:
+            self._agent_files[f"__stderr__{name}"] = f
+        return f
 
     def close(self) -> None:
         with self._lock:
