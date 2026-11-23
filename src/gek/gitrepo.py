@@ -238,6 +238,19 @@ class Repo:
     async def merge_into_main(self, branch: str, message: str, ident: Identity,
                               actor: str) -> tuple[bool, str]:
         """Merge a branch into main with merge-tree (no worktree). Returns (ok, sha-or-conflicts)."""
+        wl = await self.git("worktree", "list", "--porcelain", check=False)
+        holders = []
+        cur = None
+        for line in wl.splitlines():
+            if line.startswith("worktree "):
+                cur = line[9:]
+            elif line.strip() == f"branch refs/heads/{MAIN}":
+                holders.append(cur)
+        if holders:
+            return False, (f"{MAIN} is checked out in a worktree ({', '.join(map(str, holders))}). "
+                           f"Moving the {MAIN} ref under a checkout makes that worktree look dirty. "
+                           "Switch that worktree back to its own branch (git checkout <your branch>) "
+                           f"and retry. Never check out {MAIN} in a worktree.")
         async with self.ref_lock:
             main = await self.tip(MAIN)
             src = await self.tip(branch)
@@ -267,4 +280,5 @@ class Repo:
                 result = f"merged as {sha[:10]}"
         if self.log:
             self.log.event("merge", actor, branch=branch, ok=True, sha=sha, result=result)
-        return True, result
+        return True, (result + f". Only the {MAIN} ref moved; worktrees are untouched (that is "
+                      f"expected). Check it with read_log refs=[{MAIN}] or read_file ref={MAIN}.")

@@ -182,9 +182,14 @@ class Agent:
 
     async def t_run(self, command: str, timeout_s: int | None = None) -> str:
         limit = min(timeout_s or 10**9, self.swarm.cfg.section("agents").get("shell_timeout_s", 180))
+        # shell git commits get the agent's identity too (otherwise they show up as the OS user)
+        env = dict(os.environ)
+        env.update(GIT_AUTHOR_NAME=self.ident.name, GIT_AUTHOR_EMAIL=self.ident.email,
+                   GIT_COMMITTER_NAME=self.ident.name, GIT_COMMITTER_EMAIL=self.ident.email,
+                   GEK_AGENT=self.h.id, GEK_ROLE=self.h.role.name, GEK_BRANCH=self.h.branch)
         proc = await asyncio.create_subprocess_shell(
             command, cwd=str(self.h.worktree), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT)
+            stderr=asyncio.subprocess.STDOUT, env=env)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=limit)
         except asyncio.TimeoutError:
@@ -234,6 +239,23 @@ class Agent:
         self.messages.append(msg)
         self.swarm.log.transcript(self.h.id, msg)
 
+    def _shrink_written(self, tc: dict[str, Any]) -> None:
+        """After write_file runs, drop the file body from the history we resend. The file is on
+        disk; resending it every step was ~30% of a builder's prompt tokens. Done once, right
+        away, so the history prefix stays stable for provider-side prompt caching.
+        (The transcript log already has the full call.)"""
+        if tc["function"]["name"] != "write_file":
+            return
+        try:
+            args = json.loads(tc["function"]["arguments"] or "{}")
+        except Exception:
+            return
+        content = args.get("content")
+        if isinstance(content, str) and len(content) > 300:
+            args["content"] = (f"<{len(content)} chars written to {args.get('path')}; "
+                               "use read_file if you need it again>")
+            tc["function"]["arguments"] = json.dumps(args)
+
     def _elide(self) -> None:
         total = sum(len(json.dumps(m, default=str)) for m in self.messages)
         if total <= CONTEXT_SOFT_LIMIT:
@@ -273,6 +295,7 @@ class Agent:
                 for tc in calls:
                     out = await self.box.run(tc["function"]["name"], tc["function"]["arguments"])
                     self._record({"role": "tool", "tool_call_id": tc["id"], "content": out})
+                    self._shrink_written(tc)
                 if self.finished is not None:
                     how = "finish"
                     h.summary = self.finished

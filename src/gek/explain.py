@@ -61,9 +61,24 @@ async def explain(cfg: Config, run_id: str | None = None, chatter_n: int = 25) -
         w(f"from {_fmt_t(start)} to {_fmt_t(end)} ({round((end - start) / 60, 1)} min), {len(ev)} events")
         w("ended: " + (endrec["data"].get("reason", "?") if endrec else "no run_end event (crashed or still running?)"))
         toks = sum((e["data"].get("usage") or {}).get("total_tokens", 0) for e in ev if e["kind"] == "llm_response")
+        cached = sum((e["data"].get("usage") or {}).get("cached_prompt_tokens", 0) or 0
+                     for e in ev if e["kind"] == "llm_response")
         cost = sum(e["data"].get("cost") or 0 for e in ev if e["kind"] == "llm_response")
-        w(f"model calls: {kinds['llm_response']} ok, {kinds['llm_error']} failed; tokens {toks}; cost ${cost:.4f}")
+        w(f"model calls: {kinds['llm_response']} ok, {kinds['llm_error']} failed; tokens {toks}"
+          f" ({cached} prompt tokens served from cache); cost ${cost:.4f}")
         w(f"orchestrator wakes: {kinds['orch_wake']}")
+        per: dict[str, list[int]] = {}
+        for e in ev:
+            if e["kind"] == "llm_response":
+                u = e["data"].get("usage") or {}
+                r = per.setdefault(e["actor"], [0, 0, 0])
+                r[0] += 1
+                r[1] += u.get("prompt_tokens", 0) or 0
+                r[2] += u.get("completion_tokens", 0) or 0
+        if per:
+            w("tokens by actor (calls, prompt, completion, avg prompt/call):")
+            for a, (n, pt, ct) in sorted(per.items(), key=lambda kv: -(kv[1][1] + kv[1][2])):
+                w(f"  {a:<24} {n:>4} {pt:>10} {ct:>9} {pt // max(n, 1):>9}")
         spawns = [e for e in ev if e["kind"] == "agent_spawn"]
         exits = {e["actor"]: e for e in ev if e["kind"] == "agent_exit"}
         w(f"agents: {len(spawns)} spawned; exits: " +

@@ -111,6 +111,12 @@ class LLM:
                 except Exception:
                     cost = 0.0
                 usage["served_model"] = getattr(resp, "model", None)
+                details = getattr(u, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", None) if details is not None else None
+                if cached is None:
+                    cached = getattr(u, "prompt_cache_hit_tokens", None)  # DeepSeek-style field
+                if cached is not None:
+                    usage["cached_prompt_tokens"] = cached
         except BudgetExceeded:
             raise
         except Exception as e:

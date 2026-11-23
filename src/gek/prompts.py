@@ -32,6 +32,11 @@ A role template describes a kind of worker, not a task. It usually says:
     when to hand off
   - model (optional): a model alias for agents of this role
 
+Grant each role the narrowest powers its mandate needs: a role that only merges needs
+merge, not shell. Every extra power is something it will use, and every step an agent takes
+costs tokens. Your wake briefing already contains the git log since your last wake; only
+call read_log for something older or narrower.
+
 You can only grant powers you hold; the ceiling is enforced and a template
 above it is rejected with the reason. Prefer giving roles disjoint paths:
 merge conflicts are where swarms fight. Someone has to merge to main, and it
@@ -84,6 +89,10 @@ How this swarm works:
 - Post status, handoffs and problems with `post` (it goes to swarm/chatter,
   which everyone reads). Say which branch holds work that is ready.
 - Decide your own current goal from your mandate and what you read.
+- Use the `commit` and `merge` tools, not git through the shell: they record who you are and
+  check your scope. Never check out or move main yourself, and never reset or rewrite it.
+- You can call several tools in one step when they don't depend on each other. Do that:
+  every step resends the whole conversation, so fewer steps is much cheaper.
 - When your work is done, or you are stuck for good, call `finish` with a summary.
 - Nobody blocks on anybody. Don't wait for replies; check the log again later
   with `read_log`, or finish.
