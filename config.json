@@ -1,0 +1,55 @@
+{
+  "_comment": "gek config. Secrets go in .env, not here. See README.md for every key.",
+  "swarm_dir": "swarm",
+  "goal": "Describe what the swarm should work on. The orchestrator reads this every wake.",
+  "api": {
+    "api_base_env": "GEK_API_BASE",
+    "api_key_env": "GEK_API_KEY"
+  },
+  "models": {
+    "orchestrator": "vllm-sr/auto",
+    "default": "vllm-sr/auto",
+    "aliases": {
+      "smart": "vllm-sr/auto",
+      "cheap": "vllm-sr/auto"
+    }
+  },
+  "llm": {
+    "temperature": null,
+    "timeout_s": 600,
+    "num_retries": 3,
+    "extra_params": {}
+  },
+  "orchestrator": {
+    "default_sleep_s": 300,
+    "min_sleep_s": 20,
+    "max_sleep_s": 3600,
+    "debounce_s": 10,
+    "inbox_poll_s": 5,
+    "max_steps_per_wake": 30,
+    "log_chars_per_wake": 30000,
+    "wake_on_agent_exit": true
+  },
+  "agents": {
+    "max_alive": 6,
+    "max_steps": 60,
+    "max_tool_output_chars": 12000,
+    "shell_timeout_s": 180
+  },
+  "budget": {
+    "max_total_tokens": 5000000
+  },
+  "ceiling": {
+    "_comment": "The most power the orchestrator may grant to any role.",
+    "shell": true,
+    "merge": true,
+    "interrupt": true,
+    "kill": [
+      "*"
+    ],
+    "mcp": {}
+  },
+  "mcp_servers": {
+    "_comment": "name -> {command, args, env}. Grant them to roles via ceiling.mcp."
+  }
+}

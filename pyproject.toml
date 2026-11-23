@@ -1,0 +1,41 @@
+[project]
+name = "gek"
+version = "0.1.0"
+description = "An asynchronous swarm harness: an LLM orchestrator spawns role-based agents that coordinate through a git repo."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "voxathon", email = "moxxie@knolastna.me" }
+]
+requires-python = ">=3.12"
+keywords = ["agents", "llm", "swarm", "orchestration", "git", "litellm", "mcp"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "litellm>=1.50",
+    "python-dotenv>=1.0",
+    "mcp>=2.0",
+]
+[project.urls]
+Homepage = "https://knolastna.me"
+Repository = "https://github.com/voxathon/gek"
+Issues = "https://github.com/voxathon/gek/issues"
+
+[project.scripts]
+gek = "gek:main"
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# ship the package, README and tests; never the local config, secrets or swarm state
+source-exclude = ["config.json", ".env", "swarm", "**/__pycache__"]
