@@ -443,7 +443,7 @@ class GekTUI(App):
         self.runs: list[Path] = []
         self.run_idx = -1
         self.follow_latest = True
-        self.run: RunData | None = None
+        self.cur: RunData | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -525,13 +525,13 @@ class GekTUI(App):
         feed.clear()
         self.run_idx = idx
         if not self.runs or idx < 0:
-            self.run = None
+            self.cur = None
         else:
-            self.run = RunData(self.runs[idx] / "events.jsonl")
-            self.run.poll()
-            for line in self.run.feed:
+            self.cur = RunData(self.runs[idx] / "events.jsonl")
+            self.cur.poll()
+            for line in self.cur.feed:
                 feed.write(Text(line))
-            self.run.new_feed.clear()
+            self.cur.new_feed.clear()
         self.redraw()
 
     def action_prev_run(self) -> None:
@@ -554,18 +554,18 @@ class GekTUI(App):
             if self.follow_latest:
                 self.open_run(len(runs) - 1)
                 return
-        changed = self.run.poll() if self.run else False
-        live = self.run is not None and self.run.ended is None and running_run(self.cfg) == self.run.path.parent.name
+        changed = self.cur.poll() if self.cur else False
+        live = self.cur is not None and self.cur.ended is None and running_run(self.cfg) == self.cur.path.parent.name
         if changed or live:
-            if self.run and self.run.new_feed:
+            if self.cur and self.cur.new_feed:
                 feed = self.query_one("#feed", RichLog)
-                for line in self.run.new_feed:
+                for line in self.cur.new_feed:
                     feed.write(Text(line))
-                self.run.new_feed.clear()
+                self.cur.new_feed.clear()
             self.redraw()
 
     def redraw(self) -> None:
-        run = self.run
+        run = self.cur
         stats = self.query_one("#stats", Static)
         if self.cfg is None:
             return
@@ -623,11 +623,11 @@ class GekTUI(App):
                 t.move_cursor(row=min(keep, t.row_count - 1), animate=False)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if self.run is None or event.row_key is None:
+        if self.cur is None or event.row_key is None:
             return
         aid = str(event.row_key.value)
-        path = self.run.path.parent / "agents" / (aid.replace("/", "__") + ".jsonl")
-        self.push_screen(TranscriptScreen(path, aid, self.run, self.cfg))
+        path = self.cur.path.parent / "agents" / (aid.replace("/", "__") + ".jsonl")
+        self.push_screen(TranscriptScreen(path, aid, self.cur, self.cfg))
 
 
 def run_tui(initial: Config | None) -> None:

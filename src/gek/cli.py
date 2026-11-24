@@ -26,7 +26,7 @@ from pathlib import Path
 from .config import (DEFAULT_CONFIG, ENV_TEMPLATE, NAME_OK, Config, current_swarm, gek_home,
                      is_gek_config, list_swarms, load_config, load_swarm, set_current_swarm,
                      swarms_dir, write_default_config, write_home_defaults, write_swarm_config)
-from .gitrepo import INBOX, Identity, Repo
+from .gitrepo import INBOX, GitError, Identity, Repo
 
 
 class UserError(Exception):
@@ -75,11 +75,19 @@ async def _init(args: argparse.Namespace) -> int:
         d.mkdir(parents=True, exist_ok=True)
         write_swarm_config(d / "config.json", args.goal)
         cfg = load_swarm(args.name)
-        set_current_swarm(args.name)
     if cfg.repo_dir.exists():
         print(f"swarm repo already exists at {cfg.repo_dir}")
         return 0
-    await Repo.init(cfg.repo_dir, cfg.raw.get("goal", ""), seed, None)
+    try:
+        await Repo.init(cfg.repo_dir, cfg.raw.get("goal", ""), seed, None)
+    except BaseException:
+        # don't leave a half-made swarm behind that blocks a retry with the same name
+        import shutil
+
+        shutil.rmtree(cfg.swarm_dir if not cfg.portable else cfg.repo_dir, ignore_errors=True)
+        raise
+    if not cfg.portable:
+        set_current_swarm(args.name)
     cfg.logs_dir.mkdir(parents=True, exist_ok=True)
     print(f"created swarm {cfg.name!r} at {cfg.swarm_dir}" + (f" (seeded from {seed})" if seed else ""))
     if not cfg.portable:
@@ -282,6 +290,10 @@ def main(argv: list[str] | None = None) -> None:
     except (UserError, FileNotFoundError) as e:
         print(f"gek: {e}", file=sys.stderr)
         code = 2
+    except GitError as e:
+        print(f"gek: git {' '.join(e.args_list)} failed (exit {e.code}):\n{(e.err or e.out).strip()}",
+              file=sys.stderr)
+        code = 1
     except KeyboardInterrupt:
         code = 130
     sys.exit(code)

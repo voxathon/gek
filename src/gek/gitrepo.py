@@ -35,6 +35,7 @@ class GitError(RuntimeError):
     def __init__(self, args: list[str], code: int, out: str, err: str):
         super().__init__(f"git {' '.join(args)} failed ({code}): {err.strip() or out.strip()}")
         self.code, self.out, self.err = code, out, err
+        self.args_list = list(args)
 
 
 @dataclass
