@@ -281,6 +281,8 @@ ENV_TEMPLATE = """\
 # gek secrets. Never commit this file.
 GEK_API_BASE=https://app.vllm-sr.ai/v1
 GEK_API_KEY=put-your-key-here
+# password for `gek tui --web` (needed when serving beyond localhost)
+# GEK_WEB_PASSWORD=
 """
 
 

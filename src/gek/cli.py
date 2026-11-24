@@ -71,6 +71,83 @@ def _seed_source(seed: str) -> str:
 
 
 # ------------------------------------------------------------------ commands
+async def init_home_swarm(name: str, goal: str | None, seed: str | None) -> tuple[Config, list[str]]:
+    """Create ~/.gek/swarms/NAME (config, repo, logs) and make it current. Used by `gek init`
+    and the TUI's new-swarm form. Cleans up after itself if anything fails."""
+    import shutil
+
+    if not NAME_OK.match(name or ""):
+        raise UserError(f"Bad swarm name {name!r}: letters, digits, - _ . only.")
+    notes = [f"wrote {p}" + (" (put your API key in it)" if p.name == ".env" else "")
+             for p in write_home_defaults()]
+    d = swarms_dir() / name
+    if (d / "config.json").exists():
+        raise UserError(f"Swarm {name!r} already exists at {d}.")
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        write_swarm_config(d / "config.json", goal)
+        cfg = load_swarm(name)
+        await Repo.init(cfg.repo_dir, cfg.raw.get("goal", ""), seed, None)
+        cfg.logs_dir.mkdir(parents=True, exist_ok=True)
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    set_current_swarm(name)
+    notes.append(f"created swarm {name!r} at {cfg.swarm_dir}" + (f" (seeded from {seed})" if seed else ""))
+    notes.append(f"it is now the current swarm. shared settings: {gek_home() / 'config.json'}; "
+                 f"this swarm's: {cfg.path}")
+    if cfg.raw.get("goal") == DEFAULT_CONFIG["goal"]:
+        notes.append("set a goal in its config.json (or pass --goal to run)")
+    return cfg, notes
+
+
+def start_detached(cfg: Config, goal: str | None = None) -> int:
+    """Start `gek run` for this swarm as its own process, detached from the terminal (or the
+    TUI, or the browser tab) that started it. Output goes to <swarm>/run.out. Returns the pid."""
+    import subprocess
+
+    if is_running(cfg):
+        raise UserError(f"{cfg.name!r} is already running ({_lock_info(cfg)})")
+    if not cfg.repo_dir.exists():
+        raise UserError(f"No swarm repo at {cfg.repo_dir}; run `gek init` first.")
+    cmd = [sys.executable, "-m", "gek"]
+    cmd += ["-c", str(cfg.path)] if cfg.portable else ["-s", cfg.name]
+    cmd += ["run", "-q"] + (["--goal", goal] if goal else [])
+    out = open(cfg.swarm_dir / "run.out", "a", encoding="utf-8")
+    out.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
+    out.flush()
+    kw: dict = {}
+    if os.name == "nt":
+        kw["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                               | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                               | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    else:
+        kw["start_new_session"] = True
+    proc = subprocess.Popen(cmd, stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+                            cwd=str(cfg.swarm_dir), **kw)
+    out.close()
+    return proc.pid
+
+
+async def push_swarm(cfg: Config, remote: str, branch: str = "main", to: str | None = None,
+                     everything: bool = False) -> str:
+    """Push swarm work out: a branch to REMOTE as <prefix>/<branch> (prefix gek/<swarm>), or
+    every branch with everything=True. It never touches the remote's own branches."""
+    repo = Repo(cfg.repo_dir)
+    name = cfg.name if not cfg.portable else Path(cfg.name).name
+    prefix = to or f"gek/{name}"
+    if everything:
+        refspecs = [f"+refs/heads/*:refs/heads/{prefix}/*"]
+        what = f"all branches as {prefix}/*"
+    else:
+        if not await repo.tip(branch):
+            raise UserError(f"no branch {branch!r} in swarm {cfg.name!r}")
+        refspecs = [f"+refs/heads/{branch}:refs/heads/{prefix}/{branch}"]
+        what = f"{branch} as {prefix}/{branch}"
+    out = await repo.git("push", remote, *refspecs)
+    return f"pushed {what} to {remote}" + (f"\n{out.strip()}" if out.strip() else "")
+
+
 async def _init(args: argparse.Namespace) -> int:
     seed = _seed_source(args.seed) if args.seed else None
     if args.portable:
@@ -87,16 +164,10 @@ async def _init(args: argparse.Namespace) -> int:
     else:
         if not args.name:
             raise UserError("Give the swarm a name: `gek init NAME` (or use --portable).")
-        if not NAME_OK.match(args.name):
-            raise UserError(f"Bad swarm name {args.name!r}: letters, digits, - _ . only.")
-        for p in write_home_defaults():
-            print(f"wrote {p}" + (" (put your API key in it)" if p.name == ".env" else ""))
-        d = swarms_dir() / args.name
-        if (d / "config.json").exists():
-            raise UserError(f"Swarm {args.name!r} already exists at {d}.")
-        d.mkdir(parents=True, exist_ok=True)
-        write_swarm_config(d / "config.json", args.goal)
-        cfg = load_swarm(args.name)
+        cfg, notes = await init_home_swarm(args.name, args.goal, seed)
+        for n in notes:
+            print(n)
+        return 0
     if cfg.repo_dir.exists():
         print(f"swarm repo already exists at {cfg.repo_dir}")
         return 0
@@ -207,6 +278,11 @@ async def _run(args: argparse.Namespace) -> int:
     from .swarm import Swarm
 
     cfg = resolve(args)
+    if args.detach:
+        pid = start_detached(cfg, args.goal)
+        print(f"started {cfg.name!r} in the background (pid {pid}); output in {cfg.swarm_dir / 'run.out'}. "
+              "Watch it with `gek tui`, stop it with `gek halt`.")
+        return 0
     if args.goal:
         cfg.raw["goal"] = args.goal
     if not cfg.repo_dir.exists():
@@ -234,23 +310,8 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _push(args: argparse.Namespace) -> int:
-    """Push swarm work out: main (or another branch) to REMOTE as gek/<swarm>/<branch>,
-    or every branch with --everything. Everything lands under one prefix, so it never
-    touches the remote's own branches."""
     cfg = resolve(args)
-    repo = Repo(cfg.repo_dir)
-    name = cfg.name if not cfg.portable else Path(cfg.name).name
-    prefix = args.to or f"gek/{name}"
-    if args.everything:
-        refspecs = [f"+refs/heads/*:refs/heads/{prefix}/*"]
-        what = f"all branches as {prefix}/*"
-    else:
-        if not await repo.tip(args.branch):
-            raise UserError(f"no branch {args.branch!r} in swarm {cfg.name!r}")
-        refspecs = [f"+refs/heads/{args.branch}:refs/heads/{prefix}/{args.branch}"]
-        what = f"{args.branch} as {prefix}/{args.branch}"
-    out = await repo.git("push", args.remote, *refspecs)
-    print(f"pushed {what} to {args.remote}" + (f"\n{out.strip()}" if out.strip() else ""))
+    print(await push_swarm(cfg, args.remote, args.branch, args.to, args.everything))
     return 0
 
 
@@ -322,6 +383,29 @@ async def _halt(args: argparse.Namespace) -> int:
     note = "" if _lock_info(cfg) else " (swarm isn't running)"
     print(f"sent halt to {cfg.name}: {sha[:10]}{note}")
     return 0
+
+
+async def do_control(cfg: Config, who: str, control: str, reason: str = "", payload: str = "") -> str:
+    """One entry point for clients (the TUI): send to a running swarm, or apply role/config/mode
+    changes to the files directly when it isn't running. Returns a line for the user."""
+    from .config import parse_value, persist_key
+
+    if is_running(cfg):
+        sha = await send_control(cfg, who, control, reason, payload)
+        return f"sent {control} ({sha[:10]}); the swarm acts on it within a few seconds"
+    verb, _, arg = control.partition(" ")
+    if verb == "role" and arg == "set":
+        return await _role_offline(cfg, who, json.loads(payload))
+    if verb == "role" and arg.startswith("retire"):
+        return await _role_offline(cfg, who, None, retire=arg[6:].strip())
+    if verb == "config" and arg.startswith("set "):
+        key = arg[4:].strip()
+        persist_key(cfg.path, key, parse_value(payload))
+        return f"{key} saved (not running; applies on the next run)"
+    if verb == "mode":
+        persist_key(cfg.path, "orchestrator.mode", arg)
+        return f"mode {arg} saved (applies on the next run)"
+    raise UserError(f"{cfg.name!r} isn't running; {verb} needs a running swarm")
 
 
 def _sent(cfg: Config, what: str, sha: str) -> None:
@@ -509,6 +593,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--goal", default=None, help="override the goal for this run")
     s.add_argument("--quiet", "-q", action="store_true", help="print nothing; everything still goes to the logs")
     s.add_argument("--verbose", "-v", action="store_true", help="echo every event (the firehose) to stderr")
+    s.add_argument("--detach", "-d", action="store_true",
+                   help="run in the background, detached from this terminal (output to <swarm>/run.out)")
     s.set_defaults(fn=_run)
 
     s = sub.add_parser("push", help="push swarm work to a git remote (URL or path)")
@@ -529,6 +615,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--web", action="store_true", help="serve the TUI in a browser (textual-serve)")
     s.add_argument("--host", default="localhost", help="web host (0.0.0.0 to reach it from other machines)")
     s.add_argument("--port", type=int, default=8000, help="web port")
+    s.add_argument("--no-auth", action="store_true",
+                   help="serve beyond localhost without a password (GEK_WEB_PASSWORD) anyway")
     s.add_argument("--public-url", default=None,
                    help="URL the browser uses, e.g. http://10.0.0.15:8000 (needed with --host 0.0.0.0)")
     s.set_defaults(fn=None)
@@ -593,7 +681,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "tui" and args.web:
         import shlex
 
-        from textual_serve.server import Server
+        from dotenv import load_dotenv
+
+        from .web import GekWebServer, is_loopback
+
+        load_dotenv(gek_home() / ".env", override=False)
+        load_dotenv(Path.cwd() / ".env", override=False)
+        password = os.environ.get("GEK_WEB_PASSWORD") or None
+        if not password and not is_loopback(args.host) and not args.no_auth:
+            print("gek: refusing to serve the control plane beyond this machine without a password.\n"
+                  f"Put GEK_WEB_PASSWORD=... in {gek_home() / '.env'} (or pass --no-auth if you really mean it).",
+                  file=sys.stderr)
+            sys.exit(2)
 
         cmd = [sys.executable, "-m", "gek"]
         if args.config:
@@ -608,8 +707,10 @@ def main(argv: list[str] | None = None) -> None:
                   "--public-url http://<this-machine's-ip>:%d" % args.port, file=sys.stderr)
             sys.exit(2)
         print(f"gek tui on {public or f'http://{args.host}:{args.port}'}  "
-              "(the app runs here; the browser only sees the app)")
-        Server(command, host=args.host, port=args.port, title="gek", public_url=public).serve()
+              "(the app runs here; the browser only sees the app)"
+              + ("; login required" if password else "; NO LOGIN"))
+        GekWebServer(command, password, host=args.host, port=args.port, title="gek",
+                     public_url=public).serve()
         sys.exit(0)
     if args.cmd == "tui":  # Textual runs its own event loop
         from .tui import run_tui

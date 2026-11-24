@@ -97,7 +97,7 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 | `gek list` (`ls`) | every swarm: current one starred, running or last run, goal |
 | `gek use NAME` | switch the current swarm |
 | `gek where` | paths of the current swarm's config, repo, worktrees, logs |
-| `gek run [--goal G] [-v \| -q]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
+| `gek run [--goal G] [-v \| -q] [--detach]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
 | `gek inbox "message" [--as NAME]` | post to the orchestrator's inbox (works while a run is going; wakes it) |
 | `gek explain [--run ID]` | human summary of a run and the repo |
 | `gek tui [--web]` | live dashboard of every swarm: graphs, agents, feed; `--web` serves it to a browser |
@@ -159,17 +159,48 @@ every result (errors in red), and wake separators for the orchestrator. It
 keeps updating while the agent lives. `f` toggles full/short, `s` shows the
 system prompt, `g`/`G` top/bottom, `esc` back.
 
-Steer a running swarm from the TUI: `i` sends an inbox message (wakes the orchestrator), `k`
-kills the selected agent, `H` halts the swarm. Each asks for a reason, which goes on the record.
-These are the same as `gek inbox`, `gek kill` and `gek halt`: commits on `swarm/inbox` that the
-running swarm picks up within `inbox_poll_s`; kill and halt carry a `Control:` trailer and are
-handled by the harness itself, not the orchestrator.
+**The TUI is the whole control plane.** You can create a swarm, start it, steer it, stop it
+and push its work without leaving it (or a browser tab):
 
-`gek tui --web` serves the same app to a browser with textual-serve. On a VM:
-`gek tui --web --host 0.0.0.0 --public-url http://10.0.0.15:8000`, then open that URL on the host.
+| Key | Does |
+| --- | --- |
+| `n` | new swarm: name, goal, seed (path or git URL), optionally start it right away |
+| `R` | start the selected swarm in the background (detached: closing the TUI or tab doesn't stop it) |
+| `s` | spawn an agent into a role, with a note |
+| `k` | kill the selected agent (asks for a reason) |
+| `i` | message the orchestrator (wakes it) |
+| `p` | pause / resume |
+| `m` | switch llm / human orchestration |
+| `w` | wake the orchestrator now |
+| `o` | roles: edit templates as JSON with live validation against the ceiling; `ctrl+s` save, `ctrl+r` retire, `ctrl+n` new |
+| `c` | config: every setting; Enter on a live one changes it (applied now if running, else next run) |
+| `P` | push the swarm's work to a git remote |
+| `H` | halt (asks for a reason) |
+| `ctrl+p` | command palette: every action above, plus "Swarm: NAME" to switch swarms |
+| `[` / `]`, `r`, `q` | older / newer run, rescan swarms, quit |
 
-Keys: up/down pick a swarm, Tab to the agents table, Enter for a transcript,
-`[` / `]` older / newer run, `r` rescan swarms, `i` / `k` / `H` steer, `q` quit.
+All of it goes through the control protocol ([docs/CONTROL.md](docs/CONTROL.md)), exactly like
+the CLI, so it's all on the record as `human`.
+
+**On a phone or any narrow window** the layout stacks: no sidebar (switch swarms with `ctrl+p`),
+one graph, the agents table above the feed.
+
+### In a browser
+
+```
+gek tui --web                                               # http://localhost:8000
+gek tui --web --host 0.0.0.0 --public-url http://10.0.0.15:8000   # from other machines
+```
+
+The TUI runs on the swarm's machine; the browser only gets the app (textual-serve), not a shell.
+Serving beyond localhost needs a password: put `GEK_WEB_PASSWORD=...` in `~/.gek/.env`. The
+browser gets a login page; the password becomes an HttpOnly, SameSite=Strict session cookie,
+checked on every route including the websocket. Restarting the server logs everyone out.
+Open it at the same address as `--public-url` so the cookie matches.
+
+This is plain HTTP: on your own LAN that's a reasonable minimum, but the cookie travels
+unencrypted. Past your LAN, use Tailscale (or an HTTPS reverse proxy) rather than opening a port.
+And remember what's behind the login: agents with `shell` can do anything the swarm's user can.
 
 ## The repo is the medium
 
@@ -303,10 +334,14 @@ src/gek/
   prompts.py      the orchestrator prior and the agent system prompt
   explain.py      `gek explain`
   tui.py          `gek tui` (Textual + plotext)
+  tui_control.py  the TUI's control screens: new swarm, spawn, push, roles, config
+  web.py          `gek tui --web` with the password gate
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
 tests/control.py  gek kill / halt / inbox against a running swarm, gek push
 tests/controlplane.py  the whole control plane through the real CLI (docs/CONTROL.md)
+tests/tui_control.py   the TUI control plane, headless: forms, editors, detached runs, phone layout
+tests/web_login.py     the web TUI's password gate
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -326,6 +361,8 @@ uv run python tests/smoke.py
 uv run python tests/limits.py
 uv run python tests/control.py
 uv run python tests/controlplane.py
+uv run python tests/tui_control.py
+uv run python tests/web_login.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

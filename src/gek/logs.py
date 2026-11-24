@@ -140,8 +140,8 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
         return f"  ~  {actor} {tag}: {_clip((d.get('args') or {}).get('message'), 150)}"
     if kind == "control":
         mark = "!!" if d.get("ok", True) else "XX"
-        return (f"  {mark} {actor} sent {d.get('verb')} {d.get('arg') or ''}: {_clip(d.get('reason'), 80)}"
-                f" -> {_clip(d.get('result'), 100)}")
+        what = " ".join(x for x in (d.get("verb"), d.get("arg")) if x)
+        return f"  {mark} {actor} sent {what}: {_clip(d.get('reason'), 80)} -> {_clip(d.get('result'), 100)}"
     if kind == "config":
         if d.get("refused"):
             return f"  x  config {d.get('key')} refused: {_clip(d.get('refused'))}"

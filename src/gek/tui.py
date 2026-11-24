@@ -429,14 +429,14 @@ class PromptScreen(ModalScreen):
     #box Label { margin-bottom: 1; }
     """
 
-    def __init__(self, title: str, placeholder: str = ""):
+    def __init__(self, title: str, placeholder: str = "", value: str = ""):
         super().__init__()
-        self._title, self._placeholder = title, placeholder
+        self._title, self._placeholder, self._value = title, placeholder, value
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
             yield Label(self._title)
-            yield Input(placeholder=self._placeholder, id="text")
+            yield Input(value=self._value, placeholder=self._placeholder, id="text")
 
     def on_mount(self) -> None:
         self.query_one("#text", Input).focus()
@@ -461,17 +461,160 @@ class GekTUI(App):
     #bottom { height: 1fr; }
     #agents { width: 1fr; }
     #feed { width: 1fr; border-left: solid $primary-darken-2; }
+    /* phones and narrow windows: no sidebar (switch swarms with ctrl+p), one graph, panels stacked */
+    .-narrow #side { display: none; }
+    .-narrow #stats { height: auto; }
+    .-narrow #wakes { display: none; }
+    .-narrow #plots { height: 12; }
+    .-narrow #p_alive, .-narrow #p_commits { display: none; }
+    .-narrow #bottom { layout: vertical; }
+    .-narrow #agents { height: 1fr; width: 100%; }
+    .-narrow #feed { height: 1fr; width: 100%; border-left: none; border-top: solid $primary-darken-2; }
     """
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-wide")]
     BINDINGS = [
         Binding("q", "quit", "quit"),
-        Binding("[", "prev_run", "older run"),
-        Binding("]", "next_run", "newer run"),
-        Binding("r", "rescan", "rescan swarms"),
-        Binding("enter", "noop", "agent transcript", show=True),
-        Binding("i", "inbox", "inbox msg"),
-        Binding("k", "kill_agent", "kill agent"),
-        Binding("H", "halt", "halt swarm"),
+        Binding("[", "prev_run", "older run", show=False),
+        Binding("]", "next_run", "newer run", show=False),
+        Binding("r", "rescan", "rescan", show=False),
+        Binding("enter", "noop", "transcript", show=True),
+        Binding("i", "inbox", "inbox"),
+        Binding("s", "spawn", "spawn"),
+        Binding("k", "kill_agent", "kill"),
+        Binding("p", "pause_toggle", "pause/resume"),
+        Binding("w", "wake", "wake", show=False),
+        Binding("m", "mode_toggle", "mode"),
+        Binding("o", "roles", "roles"),
+        Binding("c", "config", "config"),
+        Binding("n", "new_swarm", "new swarm"),
+        Binding("R", "start_run", "run"),
+        Binding("P", "push", "push", show=False),
+        Binding("H", "halt", "halt"),
     ]
+
+    # -------------------------------------------------- control plane
+    def get_system_commands(self, screen):  # the command palette (ctrl+p) lists every action
+        from textual.app import SystemCommand
+
+        yield from super().get_system_commands(screen)
+        for title, help_, action in [
+            ("New swarm", "create a swarm (name, goal, seed) and start it", self.action_new_swarm),
+            ("Run swarm", "start the selected swarm in the background", self.action_start_run),
+            ("Halt swarm", "stop the selected swarm; live agents are killed", self.action_halt),
+            ("Pause / resume", "freeze or unfreeze the swarm", self.action_pause_toggle),
+            ("Spawn agent", "spawn an agent into a role", self.action_spawn),
+            ("Kill agent", "kill the agent selected in the table", self.action_kill_agent),
+            ("Inbox message", "message the orchestrator (wakes it)", self.action_inbox),
+            ("Wake orchestrator", "wake it now", self.action_wake),
+            ("Switch mode", "llm <-> human orchestration", self.action_mode_toggle),
+            ("Roles", "view and edit role templates", self.action_roles),
+            ("Config", "view and change settings live", self.action_config),
+            ("Push", "push swarm work to a git remote", self.action_push),
+        ]:
+            yield SystemCommand(title, help_, action)
+        for name in list_swarms():
+            yield SystemCommand(f"Swarm: {name}", "switch to this swarm", lambda n=name: self._switch_to(n))
+
+    def _switch_to(self, name: str) -> None:
+        try:
+            self.select_swarm(load_swarm(name))
+            lv = self.query_one("#swarms", ListView)
+            for i, item in enumerate(lv.children):
+                if isinstance(item, SwarmItem) and item.cfg.name == name:
+                    lv.index = i
+        except Exception as e:
+            self.notify(str(e), severity="error")
+
+    async def _do(self, control: str, reason: str = "", payload: str = "") -> None:
+        from .cli import do_control
+
+        try:
+            self.notify(await do_control(self.cfg, "human", control, reason, payload))
+        except Exception as e:
+            self.notify(str(e), severity="error")
+
+    def action_new_swarm(self) -> None:
+        from .tui_control import NewSwarmScreen
+
+        def done(res) -> None:
+            if res:
+                cfg, started = res
+                self.notify(f"created {cfg.name}" + (f", {started}" if started else ""))
+                self.rescan()
+                self._switch_to(cfg.name)
+
+        self.push_screen(NewSwarmScreen(), done)
+
+    def action_start_run(self) -> None:
+        from .cli import start_detached
+
+        if self.cfg is None:
+            return
+        try:
+            pid = start_detached(self.cfg)
+            self.notify(f"{self.cfg.name} started in the background (pid {pid})")
+        except Exception as e:
+            self.notify(str(e), severity="error")
+
+    def action_spawn(self) -> None:
+        from .tui_control import SpawnScreen
+
+        if self.cfg is None or not self._live():
+            self.notify("start the swarm first (R)", severity="warning")
+            return
+
+        async def go() -> None:
+            from pathlib import Path
+
+            from .gitrepo import ROLES, Repo
+
+            roles = [Path(p).stem for p in await Repo(self.cfg.repo_dir).list_files_at(ROLES, "roles")]
+            if not roles:
+                self.notify("no roles yet: add one with o (roles)", severity="warning")
+                return
+            self.push_screen(SpawnScreen(self.cfg, roles),
+                             lambda msg: self.notify(msg) if msg else None)
+
+        self.run_worker(go())
+
+    def action_push(self) -> None:
+        from .tui_control import PushScreen
+
+        if self.cfg is not None:
+            self.push_screen(PushScreen(self.cfg), lambda msg: self.notify(msg) if msg else None)
+
+    def action_roles(self) -> None:
+        from .tui_control import RolesScreen
+
+        if self.cfg is not None:
+            self.push_screen(RolesScreen(self.cfg))
+
+    def action_config(self) -> None:
+        from .tui_control import ConfigScreen
+
+        if self.cfg is not None:
+            self.push_screen(ConfigScreen(self.cfg))
+
+    def action_wake(self) -> None:
+        if self.cfg is not None:
+            self.run_worker(self._do("wake", "woken from the TUI"))
+
+    def action_mode_toggle(self) -> None:
+        if self.cfg is None:
+            return
+        from .config import get_path
+
+        live = self.cur.mode if (self.cur and self._live()) else None
+        current = live or str(get_path(self.cfg.raw, "orchestrator.mode") or "llm")
+        new = "human" if current == "llm" else "llm"
+        self.run_worker(self._do(f"mode {new}", f"switched from the TUI ({current} -> {new})"))
+
+    def action_pause_toggle(self) -> None:
+        if self.cfg is None or not self._live():
+            self.notify("this swarm isn't running", severity="warning")
+            return
+        verb = "resume" if (self.cur and self.cur.paused) else "pause"
+        self.run_worker(self._do(verb, f"{verb}d from the TUI"))
 
     # --------------------------------------------------------- steering
     async def _send(self, control: str | None, text: str) -> str:
@@ -559,7 +702,7 @@ class GekTUI(App):
                     yield CommitsPlot(id="p_commits")
                 with Horizontal(id="bottom"):
                     yield DataTable(id="agents", zebra_stripes=True, cursor_type="row")
-                    yield RichLog(id="feed", wrap=False, highlight=False, max_lines=2000)
+                    yield RichLog(id="feed", wrap=True, highlight=False, max_lines=2000)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -723,7 +866,7 @@ class GekTUI(App):
                 t.move_cursor(row=min(keep, t.row_count - 1), animate=False)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if self.cur is None or event.row_key is None:
+        if event.data_table.id != "agents" or self.cur is None or event.row_key is None:
             return
         aid = str(event.row_key.value)
         path = self.cur.path.parent / "agents" / (aid.replace("/", "__") + ".jsonl")
