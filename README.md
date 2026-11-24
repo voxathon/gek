@@ -37,6 +37,12 @@ gek run
 Agents with the `shell` power can do anything your user can. Run swarms that
 have it inside a throwaway VM, not on a machine you care about.
 
+**Host-safe mode:** set `"shell": false` in the ceiling. Agents can then only read the log,
+read and write files inside their own worktree (paths outside it are refused), commit within
+their `writes` scope, and use the MCP tools you configured. That is safe enough to run on your
+own machine. Agents never see your API key either way: their shell commands and the MCP servers
+they start get an allowlisted environment without it (`agents.env_passthrough` adds names).
+
 ## Where things live
 
 Everything goes under one folder, `~/.gek` (or `$GEK_HOME`):
@@ -94,7 +100,14 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 | `gek run [--goal G] [-v \| -q]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
 | `gek inbox "message" [--as NAME]` | post to the orchestrator's inbox (works while a run is going; wakes it) |
 | `gek explain [--run ID]` | human summary of a run and the repo |
-| `gek tui` | live dashboard of every swarm: graphs, agents, feed |
+| `gek tui [--web]` | live dashboard of every swarm: graphs, agents, feed; `--web` serves it to a browser |
+| `gek push REMOTE [BRANCH] [--to P] [--everything]` | push swarm work to a git URL or path, as `gek/<swarm>/<branch>` |
+| `gek kill AGENT [REASON]` | kill a live agent of the running swarm, on the record |
+| `gek halt [REASON]` | stop the running swarm; live agents are killed |
+
+`--seed` takes a path or a git URL (`https://...`, `git@host:path`, `file://...`), so a VM can
+start straight from GitHub. `gek push` sends results back out without touching the remote's
+own branches: `gek push /mnt/shared/gek` lands the swarm's `main` as `gek/<swarm>/main`.
 
 Pick a swarm other than the current one with `-s NAME` (or `-c path/to/config.json`)
 before the command: `gek -s tui explain`. `--seed` clones an existing repo; its
@@ -123,8 +136,17 @@ every result (errors in red), and wake separators for the orchestrator. It
 keeps updating while the agent lives. `f` toggles full/short, `s` shows the
 system prompt, `g`/`G` top/bottom, `esc` back.
 
+Steer a running swarm from the TUI: `i` sends an inbox message (wakes the orchestrator), `k`
+kills the selected agent, `H` halts the swarm. Each asks for a reason, which goes on the record.
+These are the same as `gek inbox`, `gek kill` and `gek halt`: commits on `swarm/inbox` that the
+running swarm picks up within `inbox_poll_s`; kill and halt carry a `Control:` trailer and are
+handled by the harness itself, not the orchestrator.
+
+`gek tui --web` serves the same app to a browser with textual-serve. On a VM:
+`gek tui --web --host 0.0.0.0 --public-url http://10.0.0.15:8000`, then open that URL on the host.
+
 Keys: up/down pick a swarm, Tab to the agents table, Enter for a transcript,
-`[` / `]` older / newer run, `r` rescan swarms, `q` quit.
+`[` / `]` older / newer run, `r` rescan swarms, `i` / `k` / `H` steer, `q` quit.
 
 ## The repo is the medium
 
@@ -159,6 +181,12 @@ and the rejection is logged.
 | `interrupt` | `interrupt` tool: post to the inbox, which wakes the orchestrator |
 | `kill: [roles]` | `kill` and `list_agents` tools for agents of those roles (`"*"` = any) |
 | `mcp: {server: [tool globs]}` | connect to that MCP server and see only matching tools, as `mcp__<server>__<tool>` |
+
+**Limits are visible.** The orchestrator's wake briefing lists every cap (agents' steps,
+shell timeout, output size, its own steps per wake), what each model alias maps to, total
+spend against the budget, its own spend, and per-agent tokens. Agents are told their step and
+token caps up front and see a status line as they go, so they can commit and hand off before
+being stopped. A role's `max_tokens` stops its agents at that many tokens (`token_cap` exit).
 
 Every agent also gets `read_log`, `list_files`, `read_file`, `post`, `finish`,
 and `write_file`/`commit` if it has any `writes`.
@@ -198,8 +226,11 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `models.aliases` | names roles can use in their `model` field, e.g. `"cheap": "openai/some-small-model"` |
 | `llm.timeout_s`, `llm.num_retries`, `llm.temperature`, `llm.extra_params` | passed to litellm |
 | `orchestrator.*` | sleep bounds, debounce, inbox poll, steps per wake, log size per wake |
-| `agents.max_alive`, `agents.max_steps` | swarm size cap, steps per agent (a role can set its own `max_steps`) |
+| `agents.max_alive`, `agents.max_steps` | swarm size cap, steps per agent (a role can set its own `max_steps`, and a `max_tokens` cap per agent) |
 | `agents.max_tool_output_chars`, `agents.shell_timeout_s` | tool output cap, shell timeout |
+| `agents.env_notes` | lines every agent and the orchestrator see, e.g. `["uv is installed: use uv run", "pytest is installed"]` |
+| `agents.status_every_steps` | how often agents get a `[gek: step N/M, T tokens used]` line (every step once near a cap) |
+| `models.pricing` | USD per million tokens by model or alias, e.g. `{"vllm-sr/auto": {"input": 0.27, "cached_input": 0.07, "output": 1.1}}`; overrides litellm's price, which is $0 for custom providers |
 | `agents.env_passthrough` | env var names (default `[]`) passed through to an agent's `run` subprocesses and to the MCP servers it starts; everything not on the built-in allowlist is dropped, and `api.api_base_env`/`api.api_key_env` are never passed even if listed. An MCP server that needs its own key gets it through its `env` in `mcp_servers`. |
 | `budget.max_total_tokens` | stop the swarm once this many tokens are spent (0 = no cap) |
 | `ceiling` | the most power the orchestrator may grant |
@@ -250,6 +281,8 @@ src/gek/
   explain.py      `gek explain`
   tui.py          `gek tui` (Textual + plotext)
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
+tests/limits.py   caps, status lines, briefing contents, custom pricing
+tests/control.py  gek kill / halt / inbox against a running swarm, gek push
 ```
 
 ## Publishing
@@ -261,10 +294,12 @@ uv publish --token pypi-...   # or set UV_PUBLISH_TOKEN
 
 Bump `version` in pyproject.toml and `__version__` in `src/gek/__init__.py` together.
 
-## Smoke test
+## Tests
 
 ```
 uv run python tests/smoke.py
+uv run python tests/limits.py
+uv run python tests/control.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

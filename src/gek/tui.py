@@ -2,7 +2,8 @@
 live run, a finished one, or one from four months ago.
 
 Keys: up/down pick a swarm, [ and ] step through runs, Enter on an agent opens its
-transcript (f full/short, s system prompt, esc back), q quits.
+transcript (f full/short, s system prompt, esc back), i sends an inbox message, k kills the
+selected agent, H halts the swarm, q quits.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, ListItem, ListView, RichLog, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog, Static
 from textual_plotext import PlotextPlot
 
 from .config import Config, current_swarm, gek_home, list_swarms, load_swarm
@@ -411,6 +412,36 @@ class TranscriptScreen(Screen):
         self.query_one("#t-log", RichLog).scroll_end(animate=False)
 
 
+# ------------------------------------------------------------------- prompts
+class PromptScreen(ModalScreen):
+    """One line of input. Enter sends, Esc cancels. Dismisses with the text or None."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+    CSS = """
+    PromptScreen { align: center middle; }
+    #box { width: 90; height: auto; border: round $warning; padding: 1 2; background: $surface; }
+    #box Label { margin-bottom: 1; }
+    """
+
+    def __init__(self, title: str, placeholder: str = ""):
+        super().__init__()
+        self._title, self._placeholder = title, placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Label(self._title)
+            yield Input(placeholder=self._placeholder, id="text")
+
+    def on_mount(self) -> None:
+        self.query_one("#text", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ------------------------------------------------------------------------ app
 class GekTUI(App):
     TITLE = "gek"
@@ -431,7 +462,69 @@ class GekTUI(App):
         Binding("]", "next_run", "newer run"),
         Binding("r", "rescan", "rescan swarms"),
         Binding("enter", "noop", "agent transcript", show=True),
+        Binding("i", "inbox", "inbox msg"),
+        Binding("k", "kill_agent", "kill agent"),
+        Binding("H", "halt", "halt swarm"),
     ]
+
+    # --------------------------------------------------------- steering
+    async def _send(self, control: str | None, text: str) -> str:
+        from .cli import send_control
+        from .gitrepo import INBOX, Identity, Repo
+        from .swarm import _message
+
+        if control:
+            sha = await send_control(self.cfg, "human", control, text)
+        else:
+            sha = await Repo(self.cfg.repo_dir).empty_commit(
+                INBOX, _message(text, {"From": "human"}), Identity("human", "human@outside.gek"),
+                actor="human")
+        return sha[:10]
+
+    def _live(self) -> bool:
+        return self.cfg is not None and running_run(self.cfg) is not None
+
+    def action_inbox(self) -> None:
+        if self.cfg is None:
+            return
+
+        async def done(text: str | None) -> None:
+            if text and text.strip():
+                sha = await self._send(None, text.strip())
+                self.notify(f"sent to {self.cfg.name}'s inbox ({sha})"
+                            + ("" if self._live() else "; swarm isn't running, it'll read it next run"))
+
+        self.push_screen(PromptScreen(f"Message to {self.cfg.name}'s orchestrator (wakes it):"), done)
+
+    def action_kill_agent(self) -> None:
+        t = self.query_one("#agents", DataTable)
+        if self.cfg is None or not t.row_count:
+            return
+        aid = str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+        a = self.cur.agents.get(aid) if self.cur else None
+        if aid == "orchestrator" or a is None or a.status != "alive" or not self._live():
+            self.notify(f"{aid} isn't a live agent of a running swarm", severity="warning")
+            return
+
+        async def done(reason: str | None) -> None:
+            if reason is not None:
+                sha = await self._send(f"kill {aid}", reason.strip() or "killed from the TUI")
+                self.notify(f"kill {aid} sent ({sha}); it lands within a few seconds")
+
+        self.push_screen(PromptScreen(f"Kill {aid}? Reason (goes on the record), Enter to confirm, Esc to cancel:"),
+                         done)
+
+    def action_halt(self) -> None:
+        if not self._live():
+            self.notify("this swarm isn't running", severity="warning")
+            return
+
+        async def done(reason: str | None) -> None:
+            if reason is not None:
+                sha = await self._send("halt", reason.strip() or "halted from the TUI")
+                self.notify(f"halt sent ({sha}); live agents will be killed")
+
+        self.push_screen(PromptScreen(f"Halt {self.cfg.name}? Reason, Enter to confirm, Esc to cancel:"), done)
 
     def action_noop(self) -> None:  # Enter is handled by the agents table (RowSelected)
         pass

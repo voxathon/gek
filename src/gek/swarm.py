@@ -51,6 +51,7 @@ class Swarm:
         self.halted: str | None = None
         self.last_wake: float = 0.0
         self.wakes = 0
+        self.started: float = 0.0
         self.orch_ident = Identity("orchestrator", "orchestrator@swarm.gek")
 
     # -------------------------------------------------------------- helpers
@@ -73,7 +74,12 @@ class Swarm:
         rows = []
         for a in self.agents.values():
             age = round(time.time() - a.spawned_at)
-            rows.append(f"{a.id:<24} {a.status:<9} steps={a.steps:<3} age={age}s branch={a.branch}"
+            pa = self.llm.per_actor.get(a.id, {})
+            cap_s = a.role.max_steps or self.cfg.section("agents").get("max_steps", 60)
+            tok = int(pa.get("tokens", 0))
+            tok_s = f"{tok // 1000}k" + (f"/{a.role.max_tokens // 1000}k" if a.role.max_tokens else "")
+            rows.append(f"{a.id:<24} {a.status:<9} steps={a.steps}/{cap_s} tokens={tok_s} "
+                        f"age={age}s branch={a.branch}"
                         + (f" summary={a.summary[:120]!r}" if a.summary else ""))
         return "\n".join(rows) or "(no agents this run)"
 
@@ -177,10 +183,11 @@ class Swarm:
 
         async def write_role(name: str, mandate: str, reads: list[str] | None = None,
                              writes: list[str] | None = None, powers: dict[str, Any] | None = None,
-                             temperament: str = "", model: str = "", max_steps: int = 0) -> str:
+                             temperament: str = "", model: str = "", max_steps: int = 0,
+                             max_tokens: int = 0) -> str:
             return await self.write_role(dict(name=name, mandate=mandate, reads=reads, writes=writes,
                                               powers=powers or {}, temperament=temperament,
-                                              model=model, max_steps=max_steps))
+                                              model=model, max_steps=max_steps, max_tokens=max_tokens))
 
         async def retire_role(name: str, reason: str = "") -> str:
             return await self.retire_role(name, reason)
@@ -226,7 +233,7 @@ class Swarm:
         box.add("list_roles", "Show current role templates.", obj(), list_roles)
         box.add("write_role", "Create or replace a role template. Validated against your ceiling.",
                 obj(["name", "mandate"], name=S, mandate=S, reads=arr(), writes=arr(),
-                    powers=powers_schema, temperament=S, model=S, max_steps=I), write_role)
+                    powers=powers_schema, temperament=S, model=S, max_steps=I, max_tokens=I), write_role)
         box.add("retire_role", "Retire a role template.", obj(["name"], name=S, reason=S), retire_role)
         box.add("list_agents", "List agents spawned this run and their status.", obj(), list_agents)
         box.add("spawn", "Spawn agents into a role. resume_branch starts the new agent from an "
@@ -256,6 +263,12 @@ class Swarm:
         ceiling = {k: v for k, v in self.cfg.raw.get("ceiling", {}).items() if not k.startswith("_")}
         mcp_avail = sorted(k for k in self.cfg.raw.get("mcp_servers", {}) if not k.startswith("_"))
         aliases = self.cfg.raw.get("models", {}).get("aliases", {})
+        acfg = self.cfg.section("agents")
+        me = self.llm.per_actor.get(ORCH, {})
+        elapsed = (time.time() - self.started) / 60 if self.started else 0
+        from .agent import env_notes_text
+
+        notes = env_notes_text(self.cfg)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": ORCHESTRATOR_PRIOR},
             {"role": "user", "content": (
@@ -264,11 +277,22 @@ class Swarm:
                 f"Goal:\n{self.goal}\n\n"
                 f"Your ceiling (most you may grant): {json.dumps(ceiling)}\n"
                 f"MCP servers available: {mcp_avail or 'none'}\n"
-                f"Model aliases for roles: {sorted(aliases) or 'none'} (blank = default)\n"
-                f"Limits: max {self.cfg.section('agents').get('max_alive')} live agents; "
-                f"sleep between {ocfg.get('min_sleep_s')}s and {ocfg.get('max_sleep_s')}s.\n"
-                f"Tokens used so far: {self.llm.total_tokens}"
-                f" of {self.llm.max_tokens_budget or 'unlimited'}.\n\n"
+                f"Models: default {self.cfg.raw['models'].get('default')}; aliases for roles: "
+                f"{json.dumps({k: v for k, v in aliases.items() if not k.startswith('_')}) or 'none'} "
+                f"(aliases that map to the same model behave the same)\n"
+                f"Limits:\n"
+                f"- max {acfg.get('max_alive')} live agents\n"
+                f"- each agent: {acfg.get('max_steps')} steps unless its role sets max_steps; no token cap "
+                f"unless its role sets max_tokens; shell timeout {acfg.get('shell_timeout_s')}s; tool output "
+                f"cut at {acfg.get('max_tool_output_chars')} chars\n"
+                f"- you: {ocfg.get('max_steps_per_wake')} steps per wake; sleep between "
+                f"{ocfg.get('min_sleep_s')}s and {ocfg.get('max_sleep_s')}s\n"
+                f"Spend: {self.llm.total_tokens:,} tokens"
+                f" of {f'{self.llm.max_tokens_budget:,}' if self.llm.max_tokens_budget else 'unlimited'} "
+                f"(${self.llm.total_cost:.4f}); you alone: {int(me.get('tokens', 0)):,} tokens over "
+                f"{int(me.get('calls', 0))} calls. Run time {elapsed:.1f} min, wake {self.wakes}.\n"
+                + (f"Environment notes (agents see these too):\n{notes}\n" if notes else "")
+                + "\n"
                 f"Role templates:\n{self.describe_roles()}\n\n"
                 f"Agents:\n{self.describe_agents()}\n\n"
                 f"Git log {'since your last wake' if since else '(everything)'}:\n{log_since}\n")},
@@ -304,25 +328,54 @@ class Swarm:
         return secs, why
 
     async def _inbox_watch(self) -> None:
+        """Watch swarm/inbox for commits from outside this process (gek inbox, gek kill/halt,
+        the TUI, plugins in other processes). Plain messages wake the orchestrator; commits with
+        a `Control:` trailer are handled by the harness itself: `kill <agent>` or `halt`."""
         poll = self.cfg.section("orchestrator").get("inbox_poll_s", 5)
         last = await self.repo.tip(INBOX)
+        fmt = "%H%x1f%an%x1f%(trailers:key=Control,valueonly,separator=%x2c)%x1f%B%x1e"
         while True:
             await asyncio.sleep(poll)
             tip = await self.repo.tip(INBOX)
-            if tip and tip != last:
-                author = (await self.repo.git("log", "-1", "--format=%an", tip, check=False)).strip()
-                swarm_actor = author in self.agents or author in (ORCH, "gek")
-                if not swarm_actor:  # in-process posts already woke us
-                    msg = await self.repo.git("log", "-1", "--format=%B", tip, check=False)
-                    self.log.event("inbox", author, message=msg.strip(), sha=tip, external=True)
+            if not tip or tip == last:
+                continue
+            span = f"{last}..{tip}" if last else tip
+            out = await self.repo.git("log", "--reverse", f"--format={fmt}", span, check=False)
+            last = tip
+            for rec in out.split("\x1e"):
+                if not rec.strip():
+                    continue
+                sha, author, control, body = (rec.strip("\n").split("\x1f") + [""] * 4)[:4]
+                if author in self.agents or author in (ORCH, "gek"):
+                    continue  # in-process posts already woke us
+                control = control.strip()
+                if control:
+                    await self._control(author, control, body.strip(), sha)
+                else:
+                    self.log.event("inbox", author, message=body.strip(), sha=sha, external=True)
                     self.request_wake(f"inbox from {author}")
-                last = tip
+
+    async def _control(self, author: str, control: str, body: str, sha: str) -> None:
+        verb, _, arg = control.partition(" ")
+        reason = body.split("\n\n")[0].strip() or control
+        self.log.event("control", author, verb=verb, arg=arg.strip(), reason=reason, sha=sha)
+        if verb == "kill":
+            res = await self.kill(arg.strip(), author, reason)
+            self.log.event("note", author, control_result=res)
+            if not res.startswith("ERROR"):
+                self.request_wake(f"{author} killed {arg.strip()}")
+        elif verb == "halt":
+            self.halted = f"halted by {author}: {reason}"
+            self.request_wake(f"halt by {author}")
+        else:
+            self.log.event("note", author, error=f"unknown control {control!r}")
 
     async def run(self) -> str:
         ocfg = self.cfg.section("orchestrator")
         self.log.write_meta({"run": self.log.run_id, "started": time.time(), "version": __version__,
                              "python": sys.version, "platform": platform.platform(),
                              "config_path": str(self.cfg.path), "config": self.cfg.redacted()})
+        self.started = time.time()
         self.log.event("run_start", "harness", version=__version__, goal=self.goal,
                        config=self.cfg.redacted(), platform=platform.platform(), python=sys.version)
         await self.load_roles()
@@ -331,6 +384,11 @@ class Swarm:
         reasons = ["start"]
         try:
             while not self.halted:
+                # Clear wake requests *before* the wake, not after: anything that arrives while
+                # the orchestrator is awake (an inbox message, an agent exiting) must still
+                # cause another wake once this one sleeps.
+                self.wake.clear()
+                self.wake_reasons = []
                 try:
                     secs, _ = await self._orch_wake(reasons)
                 except BudgetExceeded as e:
@@ -344,8 +402,6 @@ class Swarm:
                                    retry_in_s=secs)
                 if self.halted:
                     break
-                self.wake.clear()
-                self.wake_reasons = []
                 try:
                     await asyncio.wait_for(self.wake.wait(), timeout=secs)
                     # interrupted: debounce, and never wake twice within min_sleep

@@ -44,6 +44,7 @@ class Role:
     temperament: str = ""
     model: str = ""
     max_steps: int = 0
+    max_tokens: int = 0  # per agent of this role; 0 = no cap beyond the swarm budget
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2) + "\n"
@@ -75,6 +76,7 @@ class Role:
             temperament=str(d.get("temperament") or ""),
             model=str(d.get("model") or ""),
             max_steps=int(d.get("max_steps") or 0),
+            max_tokens=int(d.get("max_tokens") or 0),
         )
 
     def may_write(self, path: str) -> bool:

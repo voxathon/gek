@@ -31,6 +31,14 @@ SHELL_ENV_NAMES = frozenset((
 SHELL_ENV_PREFIXES = ("LC_", "UV_")
 
 
+def env_notes_text(cfg) -> str:
+    """agents.env_notes: a string or a list of lines every agent (and the orchestrator) sees."""
+    notes = cfg.section("agents").get("env_notes") or ""
+    if isinstance(notes, list):
+        notes = "\n".join(f"- {n}" for n in notes)
+    return str(notes).strip()
+
+
 def safe_env(cfg) -> dict[str, str]:
     """The harness env, reduced to the allowlist plus agents.env_passthrough, minus credentials.
     Used for agent shell commands and as the base env of MCP servers agents connect to."""
@@ -306,14 +314,26 @@ class Agent:
             self._build_tools()
             h.status = "running"
             model = sw.cfg.model(h.role.model or None)
-            self._record({"role": "system", "content": agent_system(h.role, h.id, h.branch, sw.goal)})
+            max_tokens = h.role.max_tokens or 0
+            limits = (f"{max_steps} steps"
+                      + (f", {max_tokens:,} tokens" if max_tokens else "")
+                      + f"; shell commands time out after {cfg.get('shell_timeout_s', 180)}s"
+                      + f"; tool output is cut at {cfg.get('max_tool_output_chars', 12000):,} chars")
+            self._record({"role": "system", "content": agent_system(
+                h.role, h.id, h.branch, sw.goal, limits=limits, env_notes=env_notes_text(sw.cfg))})
             chatter = await sw.repo.log_text([CHATTER], limit=30, max_chars=8000)
             mainlog = await sw.repo.log_text([MAIN], limit=10, max_chars=3000)
             self._record({"role": "user", "content": (
                 f"You have just been spawned. Note from the orchestrator: {h.note or '(none)'}\n\n"
                 f"Recent chatter:\n{chatter}\n\nRecent main:\n{mainlog}\n\nBegin.")})
             tools = self.box.schemas()
+            every = max(1, int(cfg.get("status_every_steps", 5)))
             for step in range(max_steps):
+                used = sw.llm.actor_tokens(h.id)
+                if max_tokens and used >= max_tokens:
+                    how = "token_cap"
+                    h.summary = f"stopped at the role's token cap ({used:,} of {max_tokens:,})"
+                    break
                 h.steps = step + 1
                 self._elide()
                 msg = await sw.llm.chat(h.id, model, self.messages, tools)
@@ -323,10 +343,21 @@ class Agent:
                     self._record({"role": "user", "content": (
                         "Keep going with tools. If you are done, commit and call finish.")})
                     continue
+                results = []
                 for tc in calls:
                     out = await self.box.run(tc["function"]["name"], tc["function"]["arguments"])
-                    self._record({"role": "tool", "tool_call_id": tc["id"], "content": out})
+                    results.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
                     self._shrink_written(tc)
+                # status line: every few steps, and every step once near a limit
+                used = sw.llm.actor_tokens(h.id)
+                near = (h.steps >= 0.8 * max_steps) or bool(max_tokens and used >= 0.8 * max_tokens)
+                if self.finished is None and (h.steps % every == 0 or near):
+                    line = (f"\n\n[gek: step {h.steps}/{max_steps}, {used:,} tokens used"
+                            + (f" of {max_tokens:,}" if max_tokens else "")
+                            + (". Close to a limit: commit and finish soon." if near else "") + "]")
+                    results[-1]["content"] += line
+                for r in results:
+                    self._record(r)
                 if self.finished is not None:
                     how = "finish"
                     h.summary = self.finished
@@ -348,6 +379,8 @@ class Agent:
             sw.log.event("note", h.id, error=h.summary)
         finally:
             h.status = {"finish": "finished", "killed": "killed"}.get(how, "failed" if how == "error" else how)
+            if how == "max_steps" and not h.summary:
+                h.summary = f"stopped at the step cap ({max_steps})"
             # MCP sessions must close in the task that opened them (anyio cancel scopes)
             try:
                 await self.mcp.close()

@@ -5,6 +5,9 @@
   gek list                                  all swarms, current one marked
   gek use NAME                              switch the current swarm
   gek run | explain | inbox MSG | where     act on the current swarm
+  gek push REMOTE [BRANCH] [--to D]         push swarm work to a git URL or path
+  gek kill AGENT [REASON] | halt [REASON]   steer a running swarm (handled within seconds)
+  gek tui [--web]                           dashboard in the terminal, or in a browser
   gek tui                                   watch every swarm: graphs, agents, live feed
 
 Which swarm a command acts on:
@@ -19,6 +22,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,6 +31,12 @@ from .config import (DEFAULT_CONFIG, ENV_TEMPLATE, NAME_OK, Config, current_swar
                      is_gek_config, list_swarms, load_config, load_swarm, set_current_swarm,
                      swarms_dir, write_default_config, write_home_defaults, write_swarm_config)
 from .gitrepo import INBOX, GitError, Identity, Repo
+
+
+def subprocess_list2cmd(cmd: list[str]) -> str:
+    import subprocess
+
+    return subprocess.list2cmdline(cmd)
 
 
 class UserError(Exception):
@@ -48,9 +58,19 @@ def resolve(args: argparse.Namespace) -> Config:
     return load_swarm(name)
 
 
+_URLISH = re.compile(r"^([a-z][a-z0-9+.-]*://|[^/\\\s]+@[^/\\\s]+:)", re.I)
+
+
+def _seed_source(seed: str) -> str:
+    """A git URL (https://, ssh://, git@host:path, file://) passes through; a path is resolved."""
+    if _URLISH.match(seed) and not Path(seed).exists():
+        return seed
+    return str(Path(seed).expanduser().resolve())
+
+
 # ------------------------------------------------------------------ commands
 async def _init(args: argparse.Namespace) -> int:
-    seed = Path(args.seed).resolve() if args.seed else None
+    seed = _seed_source(args.seed) if args.seed else None
     if args.portable:
         root = Path(args.dir).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -211,6 +231,53 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _push(args: argparse.Namespace) -> int:
+    """Push swarm work out: main (or another branch) to REMOTE as gek/<swarm>/<branch>,
+    or every branch with --everything. Everything lands under one prefix, so it never
+    touches the remote's own branches."""
+    cfg = resolve(args)
+    repo = Repo(cfg.repo_dir)
+    name = cfg.name if not cfg.portable else Path(cfg.name).name
+    prefix = args.to or f"gek/{name}"
+    if args.everything:
+        refspecs = [f"+refs/heads/*:refs/heads/{prefix}/*"]
+        what = f"all branches as {prefix}/*"
+    else:
+        if not await repo.tip(args.branch):
+            raise UserError(f"no branch {args.branch!r} in swarm {cfg.name!r}")
+        refspecs = [f"+refs/heads/{args.branch}:refs/heads/{prefix}/{args.branch}"]
+        what = f"{args.branch} as {prefix}/{args.branch}"
+    out = await repo.git("push", args.remote, *refspecs)
+    print(f"pushed {what} to {args.remote}" + (f"\n{out.strip()}" if out.strip() else ""))
+    return 0
+
+
+async def send_control(cfg: Config, who: str, control: str, reason: str) -> str:
+    """Post a control commit to swarm/inbox; a running swarm acts on it within inbox_poll_s."""
+    from .swarm import _message
+
+    repo = Repo(cfg.repo_dir)
+    return await repo.empty_commit(INBOX, _message(f"{control}: {reason}" if reason else control,
+                                                   {"Control": control, "From": who}),
+                                   Identity(who, f"{who}@outside.gek"), actor=who)
+
+
+async def _kill(args: argparse.Namespace) -> int:
+    cfg = resolve(args)
+    sha = await send_control(cfg, args.sender, f"kill {args.agent}", args.reason)
+    note = "" if _lock_info(cfg) else " (swarm isn't running; it will act on this next run)"
+    print(f"sent kill {args.agent} to {cfg.name}: {sha[:10]}{note}")
+    return 0
+
+
+async def _halt(args: argparse.Namespace) -> int:
+    cfg = resolve(args)
+    sha = await send_control(cfg, args.sender, "halt", args.reason)
+    note = "" if _lock_info(cfg) else " (swarm isn't running)"
+    print(f"sent halt to {cfg.name}: {sha[:10]}{note}")
+    return 0
+
+
 async def _inbox(args: argparse.Namespace) -> int:
     from .swarm import _message
 
@@ -262,13 +329,38 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--verbose", "-v", action="store_true", help="echo every event (the firehose) to stderr")
     s.set_defaults(fn=_run)
 
+    s = sub.add_parser("push", help="push swarm work to a git remote (URL or path)")
+    s.add_argument("remote", help="git URL or path, e.g. /mnt/shared/gek or git@github.com:you/repo")
+    s.add_argument("branch", nargs="?", default="main", help="swarm branch to push (default main)")
+    s.add_argument("--to", default=None, help="destination prefix (default gek/<swarm>); "
+                                              "branches land at <prefix>/<branch>")
+    s.add_argument("--everything", action="store_true",
+                   help="push every branch (main, role/*, swarm/*) under the prefix")
+    s.set_defaults(fn=_push)
+
     s = sub.add_parser("inbox", help="send a message to the orchestrator's inbox")
     s.add_argument("message")
     s.add_argument("--as", dest="sender", default="human", help="sender name (default human)")
     s.set_defaults(fn=_inbox)
 
     s = sub.add_parser("tui", help="watch swarms: graphs, agents, live feed")
+    s.add_argument("--web", action="store_true", help="serve the TUI in a browser (textual-serve)")
+    s.add_argument("--host", default="localhost", help="web host (0.0.0.0 to reach it from other machines)")
+    s.add_argument("--port", type=int, default=8000, help="web port")
+    s.add_argument("--public-url", default=None,
+                   help="URL the browser uses, e.g. http://10.0.0.15:8000 (needed with --host 0.0.0.0)")
     s.set_defaults(fn=None)
+
+    s = sub.add_parser("kill", help="kill a live agent of the running swarm, on the record")
+    s.add_argument("agent", help="agent id, e.g. coder/ab12")
+    s.add_argument("reason", nargs="?", default="", help="why (goes on the record)")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_kill)
+
+    s = sub.add_parser("halt", help="stop the running swarm (live agents are killed)")
+    s.add_argument("reason", nargs="?", default="", help="why (goes on the record)")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_halt)
 
     s = sub.add_parser("explain", help="summarize the latest run and the repo")
     s.add_argument("--run", default=None, help="run id (prefix ok)")
@@ -276,6 +368,27 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=_explain)
 
     args = p.parse_args(argv)
+    if args.cmd == "tui" and args.web:
+        import shlex
+
+        from textual_serve.server import Server
+
+        cmd = [sys.executable, "-m", "gek"]
+        if args.config:
+            cmd += ["-c", args.config]
+        if args.swarm:
+            cmd += ["-s", args.swarm]
+        cmd.append("tui")
+        command = " ".join(shlex.quote(c) for c in cmd) if os.name != "nt" else subprocess_list2cmd(cmd)
+        public = args.public_url
+        if args.host in ("0.0.0.0", "::") and not public:
+            print("gek: with --host 0.0.0.0 the page needs to know its real address; pass "
+                  "--public-url http://<this-machine's-ip>:%d" % args.port, file=sys.stderr)
+            sys.exit(2)
+        print(f"gek tui on {public or f'http://{args.host}:{args.port}'}  "
+              "(the app runs here; the browser only sees the app)")
+        Server(command, host=args.host, port=args.port, title="gek", public_url=public).serve()
+        sys.exit(0)
     if args.cmd == "tui":  # Textual runs its own event loop
         from .tui import run_tui
 

@@ -45,6 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "smart": "openai/auto",
             "cheap": "openai/auto",
         },
+        "pricing": {},
     },
     "llm": {
         "temperature": None,
@@ -68,6 +69,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_tool_output_chars": 12000,
         "shell_timeout_s": 180,
         "env_passthrough": [],
+        "env_notes": [],
+        "status_every_steps": 5,
     },
     "budget": {
         "max_total_tokens": 5_000_000,

@@ -93,7 +93,7 @@ class Repo:
 
     # ----------------------------------------------------------------- setup
     @classmethod
-    async def init(cls, path: Path, goal: str, seed_from: Path | None, log: RunLog | None) -> "Repo":
+    async def init(cls, path: Path, goal: str, seed_from: str | Path | None, log: RunLog | None) -> "Repo":
         path.parent.mkdir(parents=True, exist_ok=True)
         repo = cls(path, log)
         if seed_from:

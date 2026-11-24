@@ -26,6 +26,7 @@ class LLM:
         self.completion_tokens = 0
         self.total_cost = 0.0
         self.calls = 0
+        self.per_actor: dict[str, dict[str, float]] = {}  # actor -> tokens, cost, calls
         self._next_budget_note = 100_000
         # Tests replace this with a scripted fake: async (model, messages, tools, actor) -> dict
         self.fake = None
@@ -64,6 +65,28 @@ class LLM:
                                why="unknown provider prefix with custom api_base; treating as OpenAI-compatible")
         self._resolved[model] = out
         return out
+
+    def actor_tokens(self, actor: str) -> int:
+        return int(self.per_actor.get(actor, {}).get("tokens", 0))
+
+    def price(self, model: str, usage: dict[str, Any]) -> float | None:
+        """Cost from config models.pricing, keyed by the model name as configured (or its alias),
+        or by the model the server says it served. USD per million tokens:
+          {"input": 0.27, "cached_input": 0.07, "output": 1.1}
+        Returns None if no price is configured for this model."""
+        pricing = self.cfg.raw.get("models", {}).get("pricing") or {}
+        aliases = self.cfg.raw.get("models", {}).get("aliases") or {}
+        keys = [model, model.removeprefix("openai/"), usage.get("served_model") or ""]
+        keys += [a for a, m in aliases.items() if m in keys]
+        p = next((pricing[k] for k in keys if k and k in pricing), None)
+        if not p:
+            return None
+        prompt = usage.get("prompt_tokens", 0) or 0
+        cached = usage.get("cached_prompt_tokens", 0) or 0
+        out = usage.get("completion_tokens", 0) or 0
+        return ((prompt - cached) * float(p.get("input", 0))
+                + cached * float(p.get("cached_input", p.get("input", 0)))
+                + out * float(p.get("output", 0))) / 1_000_000
 
     async def chat(self, actor: str, model: str, messages: list[dict[str, Any]],
                    tools: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -124,7 +147,14 @@ class LLM:
                            ms=round((time.monotonic() - t0) * 1000))
             raise
         ms = round((time.monotonic() - t0) * 1000)
+        custom = self.price(model, usage)
+        if custom is not None:
+            cost = custom
         self.calls += 1
+        pa = self.per_actor.setdefault(actor, {"tokens": 0, "cost": 0.0, "calls": 0})
+        pa["tokens"] += usage.get("total_tokens", 0) or 0
+        pa["cost"] += cost
+        pa["calls"] += 1
         self.prompt_tokens += usage.get("prompt_tokens", 0)
         self.completion_tokens += usage.get("completion_tokens", 0)
         self.total_tokens += usage.get("total_tokens", 0)

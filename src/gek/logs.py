@@ -42,6 +42,7 @@ EVENT_KINDS = {
     "commit": "a commit landed on some ref; data has ref, sha, message",
     "merge": "a branch was merged to main, or a merge hit conflicts",
     "inbox": "a message arrived on swarm/inbox",
+    "control": "a kill or halt arrived from outside (gek kill/halt, the TUI); data has verb, arg, reason",
     "mcp": "an MCP server connected, failed, or listed tools",
     "budget": "token totals crossed a threshold or the budget ran out",
     "note": "anything else worth knowing",
@@ -133,6 +134,8 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
     if kind == "tool_call" and d.get("name") in ("post", "interrupt"):
         tag = "says" if d.get("name") == "post" else "interrupts"
         return f"  ~  {actor} {tag}: {_clip((d.get('args') or {}).get('message'), 150)}"
+    if kind == "control":
+        return f"  !! {actor} sent {d.get('verb')} {d.get('arg') or ''}: {_clip(d.get('reason'), 120)}"
     if kind == "inbox" and d.get("external"):
         return f"  @  inbox from {actor}: {_clip(d.get('message'), 150)}"
     if kind == "llm_error":

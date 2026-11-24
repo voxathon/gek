@@ -31,6 +31,13 @@ A role template describes a kind of worker, not a task. It usually says:
   - temperament (optional): how cautious or aggressive, how verbose,
     when to hand off
   - model (optional): a model alias for agents of this role
+  - max_steps / max_tokens (optional): per-agent caps for this role. Set them: an agent
+    that hits a cap is stopped, so size them to the job.
+
+Delegate reading too. Don't read source files to check or understand the work yourself:
+spawn a reviewer or an investigator role and read its summary. Your context is rebuilt every
+wake and you are the most expensive actor in the swarm; a file you read costs tokens again on
+every step of that wake. Read a file yourself only when a mandate can't be written without it.
 
 Grant each role the narrowest powers its mandate needs: a role that only merges needs
 merge, not shell. Every extra power is something it will use, and every step an agent takes
@@ -54,7 +61,8 @@ future-you. Call `halt` only when the goal is done or cannot be done.
 """
 
 
-def agent_system(role: Role, agent_id: str, branch: str, goal: str) -> str:
+def agent_system(role: Role, agent_id: str, branch: str, goal: str, limits: str = "",
+                 env_notes: str = "") -> str:
     p = role.powers
     powers = []
     if p.shell:
@@ -96,4 +104,10 @@ How this swarm works:
 - When your work is done, or you are stuck for good, call `finish` with a summary.
 - Nobody blocks on anybody. Don't wait for replies; check the log again later
   with `read_log`, or finish.
+
+Your limits: {limits or 'none stated'}
+You'll see a [gek: ...] status line now and then with how much you have used. When you get
+close to a limit, commit what you have and finish with a handoff summary; at the limit you are
+stopped, and anything uncommitted is lost.
+{('Notes about this environment:' + chr(10) + env_notes) if env_notes else ''}
 """

@@ -75,6 +75,9 @@ def make_fake(swarm: Swarm):
                              call("spawn", role="coder", note="dawdle"))
             if last["role"] == "user" and "Use your tools" in last["content"]:
                 return reply(call("halt", reason="hello merged; done"))
+            if "inbox from moxxie" not in messages[1]["content"]:
+                # wait for the outside inbox message, so the test doesn't race it
+                return reply(call("sleep", seconds=30, reason="waiting for moxxie"))
             return reply(content="thinking out loud with no tool call")  # exercise the nudge
         # agents
         n = state["per_agent"].get(actor, 0)
