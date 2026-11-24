@@ -94,10 +94,37 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 | `gek run [--goal G] [-v \| -q]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
 | `gek inbox "message" [--as NAME]` | post to the orchestrator's inbox (works while a run is going; wakes it) |
 | `gek explain [--run ID]` | human summary of a run and the repo |
+| `gek tui` | live dashboard of every swarm: graphs, agents, feed |
 
 Pick a swarm other than the current one with `-s NAME` (or `-c path/to/config.json`)
 before the command: `gek -s tui explain`. `--seed` clones an existing repo; its
 default branch becomes `main`.
+
+## TUI
+
+```
+gek tui
+```
+
+Every swarm under GEK_HOME in a sidebar (current one starred, running ones
+marked). For the selected swarm's latest run: a status line (running or how it
+ended, minutes, wakes, live/total agents, tokens with cache share, commits,
+merges), three graphs (tokens over time with the cached share, live agents,
+commits per minute), a table of agents (calls, prompt tokens, cache share,
+output tokens, last tool), and the live feed. It tails `events.jsonl`, so it
+works on a running swarm in another terminal and on old runs alike.
+
+Orchestrator wakes show as orange lines on the graphs and in a strip above
+them with each wake's reason ("timer", "inbox from moxxie", "coder/ab12 exited").
+
+Select an agent (or the orchestrator) in the table and press Enter for its full
+transcript: harness messages, its replies, every tool call with arguments,
+every result (errors in red), and wake separators for the orchestrator. It
+keeps updating while the agent lives. `f` toggles full/short, `s` shows the
+system prompt, `g`/`G` top/bottom, `esc` back.
+
+Keys: up/down pick a swarm, Tab to the agents table, Enter for a transcript,
+`[` / `]` older / newer run, `r` rescan swarms, `q` quit.
 
 ## The repo is the medium
 
@@ -220,6 +247,7 @@ src/gek/
   swarm.py        roles, spawning, killing, the orchestrator wake loop
   prompts.py      the orchestrator prior and the agent system prompt
   explain.py      `gek explain`
+  tui.py          `gek tui` (Textual + plotext)
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 ```
 

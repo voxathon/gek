@@ -5,6 +5,7 @@
   gek list                                  all swarms, current one marked
   gek use NAME                              switch the current swarm
   gek run | explain | inbox MSG | where     act on the current swarm
+  gek tui                                   watch every swarm: graphs, agents, live feed
 
 Which swarm a command acts on:
   -c/--config PATH  that config.json (portable)
@@ -258,12 +259,24 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--as", dest="sender", default="human", help="sender name (default human)")
     s.set_defaults(fn=_inbox)
 
+    s = sub.add_parser("tui", help="watch swarms: graphs, agents, live feed")
+    s.set_defaults(fn=None)
+
     s = sub.add_parser("explain", help="summarize the latest run and the repo")
     s.add_argument("--run", default=None, help="run id (prefix ok)")
     s.add_argument("--chatter", type=int, default=25, help="how many chatter commits to show")
     s.set_defaults(fn=_explain)
 
     args = p.parse_args(argv)
+    if args.cmd == "tui":  # Textual runs its own event loop
+        from .tui import run_tui
+
+        try:
+            initial = resolve(args)
+        except (UserError, FileNotFoundError):
+            initial = None
+        run_tui(initial)
+        sys.exit(0)
     try:
         code = asyncio.run(args.fn(args))
     except (UserError, FileNotFoundError) as e:
