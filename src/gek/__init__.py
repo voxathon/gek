@@ -1,6 +1,6 @@
 """gek: an asynchronous swarm harness with git as the shared medium."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 
 def main() -> None:

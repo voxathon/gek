@@ -38,6 +38,7 @@ async def explain(cfg: Config, run_id: str | None = None, chatter_n: int = 25) -
     w("gek: an asynchronous swarm harness. An LLM orchestrator wakes up, reads the git log,")
     w("writes role templates, spawns/kills agents, and goes back to sleep. Agents work on their")
     w("own branches in a shared git repo and talk through the swarm/chatter branch.\n")
+    w(f"swarm:     {cfg.name} ({'portable' if cfg.portable else 'home'})")
     w(f"config:    {cfg.path}")
     w(f"swarm dir: {cfg.swarm_dir}")
     w(f"goal:      {cfg.raw.get('goal', '').strip()}\n")

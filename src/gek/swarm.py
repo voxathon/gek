@@ -361,6 +361,7 @@ class Swarm:
             reason = "interrupted (Ctrl-C)"
         finally:
             watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)  # let its git subprocess close
             for a in self.alive():
                 try:
                     await self.kill(a.id, "harness", f"swarm stopping: {reason}")

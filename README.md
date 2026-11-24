@@ -14,12 +14,13 @@ beyond what's in the log.
 ## If you just came back after months
 
 ```
-uv run gek explain          # what is this, what happened last run, what's in the repo
-uv run gek explain --run 2026   # a specific run (id prefix)
+gek list                    # which swarms exist, which is current, how each last run ended
+gek explain                 # what is this, what happened last run, what's in the repo
+gek explain --run 2026      # a specific run (id prefix)
 ```
 
-Then read `swarm/logs/README.txt` for the log format, and the newest
-`swarm/logs/<run>/gek.log` for the blow-by-blow.
+Then `gek where` shows the logs folder: its `README.txt` explains the format, and the newest
+`<run>/gek.log` has the blow-by-blow.
 
 ## Install
 
@@ -27,15 +28,42 @@ Needs Python 3.12+, [uv](https://docs.astral.sh/uv/), and **git 2.38 or newer**
 (merges use `git merge-tree --write-tree`; Debian 12 ships 2.39).
 
 ```
-uv tool install gek          # or, from a checkout: uv sync, then prefix commands with `uv run`
-mkdir myswarm && cd myswarm
-gek init --goal "what the swarm should do"     # writes config.json, .env, swarm/repo.git
-# put your key in .env, pick models in config.json
+uv tool install gek
+gek init todo --goal "what the swarm should do"   # creates ~/.gek/ on first use, makes 'todo' current
+# put your key in ~/.gek/.env, pick models in ~/.gek/config.json
 gek run
 ```
 
 Agents with the `shell` power can do anything your user can. Run swarms that
 have it inside a throwaway VM, not on a machine you care about.
+
+## Where things live
+
+Everything goes under one folder, `~/.gek` (or `$GEK_HOME`):
+
+```
+~/.gek/
+  config.json            shared settings for every swarm (models, api, ceiling, limits)
+  .env                   shared secrets (GEK_API_BASE, GEK_API_KEY)
+  current                name of the current swarm
+  swarms/
+    todo/
+      config.json        this swarm's overrides: goal at least, any other key too
+      repo.git/          its git repo (the shared medium)
+      wt/                live agents' worktrees
+      logs/              one folder per run
+      run.lock           present while `gek run` is going
+    tui/ ...
+```
+
+Settings layer: built-in defaults, then `~/.gek/config.json`, then the swarm's
+own `config.json`.
+
+**Portable swarms** keep the old self-contained layout instead:
+`gek init --portable [--dir D]` writes `config.json`, `.env` and `swarm/` into
+`D`. They don't read the shared `~/.gek` settings. Any command run in a folder
+whose `config.json` is a gek config acts on that portable swarm; `-c path` points
+at one from anywhere.
 
 ## Console
 
@@ -54,19 +82,22 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 15:25:09   XX reviewer/1fba killed coder/462c: dawdling
 ```
 
-To start from an existing project instead of an empty repo:
-`uv run gek init --seed path/to/some/repo`. Its default branch becomes `main`.
-
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `gek init [--goal G] [--seed REPO] [--dir D]` | create config.json, .env, and the swarm repo |
+| `gek init NAME [--goal G] [--seed REPO]` | new swarm under `~/.gek/swarms/NAME`; becomes current |
+| `gek init --portable [--dir D] [--goal G] [--seed REPO]` | self-contained swarm in `D` |
+| `gek list` (`ls`) | every swarm: current one starred, running or last run, goal |
+| `gek use NAME` | switch the current swarm |
+| `gek where` | paths of the current swarm's config, repo, worktrees, logs |
 | `gek run [--goal G] [-v \| -q]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
 | `gek inbox "message" [--as NAME]` | post to the orchestrator's inbox (works while a run is going; wakes it) |
 | `gek explain [--run ID]` | human summary of a run and the repo |
 
-`-c path/to/config.json` goes before the command: `gek -c other.json run`.
+Pick a swarm other than the current one with `-s NAME` (or `-c path/to/config.json`)
+before the command: `gek -s tui explain`. `--seed` clones an existing repo; its
+default branch becomes `main`.
 
 ## The repo is the medium
 
@@ -133,7 +164,7 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 
 | Key | Meaning |
 | --- | --- |
-| `swarm_dir` | where repo.git, wt/ and logs/ live (relative to config.json) |
+| `swarm_dir` | where repo.git, wt/ and logs/ live, relative to config.json (`.` for home swarms, `swarm` for portable) |
 | `goal` | what the swarm is for; shown to every actor |
 | `api.api_base_env`, `api.api_key_env` | names of the env vars holding base URL and key |
 | `models.orchestrator`, `models.default` | litellm model names |
@@ -146,7 +177,8 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `ceiling` | the most power the orchestrator may grant |
 | `mcp_servers` | MCP servers available to grant |
 
-`.env` holds secrets, loaded from next to config.json and from the current directory:
+`.env` holds secrets: `~/.gek/.env` for home swarms, next to config.json for
+portable ones (a swarm folder's own `.env` and one in the current directory also load):
 
 ```
 GEK_API_BASE=https://app.vllm-sr.ai/v1
@@ -159,7 +191,7 @@ set the real names in config.json.
 
 ## Logs
 
-Overly extensive, by request. Per run, in `swarm/logs/<run>/`:
+Overly extensive, by request. Per run, in the swarm's `logs/<run>/` (`gek where` shows it):
 
 - `events.jsonl`: every event (model calls with full responses and usage, every
   tool call and result, every git command, spawns, kills, exits, merges, role
@@ -170,7 +202,7 @@ Overly extensive, by request. Per run, in `swarm/logs/<run>/`:
 - `meta.json`: run id, versions, config snapshot.
 - `mcp-<server>-<agent>.stderr.log`: whatever MCP servers print to stderr.
 
-`swarm/logs/README.txt` lists every event kind. The future TUI reads these.
+`logs/README.txt` lists every event kind. The future TUI reads these.
 
 ## Layout
 

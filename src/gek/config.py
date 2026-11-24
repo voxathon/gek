@@ -1,14 +1,29 @@
 """Configuration: .env for secrets, config.json for everything else.
 
-Lookup order for config.json: --config flag, then ./config.json.
-The .env file is loaded from the same directory as config.json (and then
-from the current directory), without overriding variables already set.
+Two layouts:
+
+  home (default)   everything under one folder, GEK_HOME or ~/.gek:
+                     ~/.gek/config.json          shared settings (models, api, ceiling...)
+                     ~/.gek/.env                 shared secrets
+                     ~/.gek/current              name of the current swarm
+                     ~/.gek/swarms/<name>/       one folder per swarm:
+                         config.json             per-swarm overrides (goal at least)
+                         repo.git/ wt/ logs/     its repo, worktrees, logs
+                         run.lock                present while `gek run` is going
+  portable         config.json + .env + swarm/ in whatever folder you chose
+                   (`gek init --portable`); any folder with a gek config.json works.
+
+Config layering: built-in defaults <- ~/.gek/config.json <- the swarm's config.json
+(portable swarms skip the shared layer). .env files: the swarm folder, then GEK_HOME
+(home swarms only), then the current directory;
+variables already set in the environment always win.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -80,10 +95,52 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def gek_home() -> Path:
+    return Path(os.environ.get("GEK_HOME") or (Path.home() / ".gek")).expanduser().resolve()
+
+
+def swarms_dir() -> Path:
+    return gek_home() / "swarms"
+
+
+def current_swarm() -> str | None:
+    f = gek_home() / "current"
+    if f.exists():
+        name = f.read_text(encoding="utf-8").strip()
+        return name or None
+    return None
+
+
+def set_current_swarm(name: str) -> None:
+    gek_home().mkdir(parents=True, exist_ok=True)
+    (gek_home() / "current").write_text(name + "\n", encoding="utf-8")
+
+
+def list_swarms() -> list[str]:
+    d = swarms_dir()
+    if not d.exists():
+        return []
+    return sorted(p.name for p in d.iterdir() if (p / "config.json").exists())
+
+
+def is_gek_config(path: Path) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return isinstance(data, dict) and "swarm_dir" in data
+    except Exception:
+        return False
+
+
 @dataclass
 class Config:
     path: Path
     raw: dict[str, Any] = field(default_factory=dict)
+    name: str = ""
+    portable: bool = False
 
     # convenience accessors -------------------------------------------------
     @property
@@ -138,18 +195,72 @@ class Config:
         }
 
 
-def load_config(path: str | os.PathLike | None = None) -> Config:
-    p = Path(path) if path else Path.cwd() / "config.json"
-    p = p.resolve()
+def _read_json(p: Path) -> dict[str, Any]:
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_config(path: str | os.PathLike | None = None, name: str = "",
+                portable: bool | None = None) -> Config:
+    """Load one swarm's config. path = that swarm's config.json."""
+    p = (Path(path) if path else Path.cwd() / "config.json").resolve()
+    home = gek_home()
+    if portable is None:
+        portable = home not in p.parents
     load_dotenv(p.parent / ".env", override=False)
+    if not portable:
+        load_dotenv(home / ".env", override=False)
     load_dotenv(Path.cwd() / ".env", override=False)
     if not p.exists():
-        raise FileNotFoundError(
-            f"No config at {p}. Run `gek init` to create config.json and .env."
-        )
-    with open(p, encoding="utf-8") as f:
-        user = json.load(f)
-    return Config(path=p, raw=_deep_merge(DEFAULT_CONFIG, user))
+        raise FileNotFoundError(f"No config at {p}. Run `gek init NAME` (or `gek init --portable`).")
+    raw = DEFAULT_CONFIG
+    glob = home / "config.json"
+    if not portable and glob.exists() and glob.resolve() != p:  # portable swarms are self-contained
+        raw = _deep_merge(raw, _read_json(glob))
+    raw = _deep_merge(raw, _read_json(p))
+    return Config(path=p, raw=raw, name=name or (p.parent.name if not portable else str(p.parent)),
+                  portable=portable)
+
+
+def load_swarm(name: str) -> Config:
+    p = swarms_dir() / name / "config.json"
+    if not p.exists():
+        have = ", ".join(list_swarms()) or "none"
+        raise FileNotFoundError(f"No swarm named {name!r} in {swarms_dir()} (have: {have}).")
+    return load_config(p, name=name, portable=False)
+
+
+def write_home_defaults() -> list[Path]:
+    """Create ~/.gek/config.json and ~/.gek/.env if missing. Returns what was written."""
+    home = gek_home()
+    home.mkdir(parents=True, exist_ok=True)
+    wrote = []
+    if not (home / "config.json").exists():
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        cfg["_comment"] = ("gek shared settings for every swarm under this folder. A swarm's own "
+                           "config.json (swarms/<name>/config.json) overrides any key. Secrets go in .env.")
+        cfg.pop("goal", None)
+        cfg.pop("swarm_dir", None)
+        with open(home / "config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        wrote.append(home / "config.json")
+    if not (home / ".env").exists():
+        (home / ".env").write_text(ENV_TEMPLATE, encoding="utf-8")
+        wrote.append(home / ".env")
+    return wrote
+
+
+def write_swarm_config(path: Path, goal: str | None) -> None:
+    """A home swarm's own config: just what differs from the shared one."""
+    cfg = {
+        "_comment": "This swarm's settings. Anything not here comes from ../../config.json.",
+        "swarm_dir": ".",
+        "goal": goal or DEFAULT_CONFIG["goal"],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
 
 
 def write_default_config(path: Path, goal: str | None) -> None:
