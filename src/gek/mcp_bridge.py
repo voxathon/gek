@@ -28,7 +28,11 @@ class MCPBridge:
         self.tools: dict[str, tuple[str, str]] = {}  # exposed name -> (server, tool)
         self.schemas: list[dict[str, Any]] = []
 
-    async def connect(self, grants: dict[str, list[str]], servers: dict[str, Any]) -> None:
+    async def connect(self, grants: dict[str, list[str]], servers: dict[str, Any],
+                      base_env: dict[str, str] | None = None) -> None:
+        """base_env: the env MCP servers start from (the agent-safe allowlist, no credentials);
+        each server's own `env` from config is added on top, so a server that needs a key gets
+        exactly the one you configured for it."""
         if not grants:
             return
         from mcp import ClientSession, StdioServerParameters
@@ -43,7 +47,7 @@ class MCPBridge:
             try:
                 params = StdioServerParameters(
                     command=spec["command"], args=spec.get("args", []),
-                    env={**os.environ, **(spec.get("env") or {})})
+                    env={**(os.environ if base_env is None else base_env), **(spec.get("env") or {})})
                 read, write = await server_stack.enter_async_context(stdio_client(params, errlog=self.log.stderr_file(f"mcp-{server}-{self.actor}")))
                 session = await server_stack.enter_async_context(ClientSession(read, write))
                 with anyio.fail_after(spec.get("timeout_s", 60)):

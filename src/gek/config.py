@@ -67,6 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_steps": 60,
         "max_tool_output_chars": 12000,
         "shell_timeout_s": 180,
+        "env_passthrough": [],
     },
     "budget": {
         "max_total_tokens": 5_000_000,

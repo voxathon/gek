@@ -200,6 +200,7 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `orchestrator.*` | sleep bounds, debounce, inbox poll, steps per wake, log size per wake |
 | `agents.max_alive`, `agents.max_steps` | swarm size cap, steps per agent (a role can set its own `max_steps`) |
 | `agents.max_tool_output_chars`, `agents.shell_timeout_s` | tool output cap, shell timeout |
+| `agents.env_passthrough` | env var names (default `[]`) passed through to an agent's `run` subprocesses and to the MCP servers it starts; everything not on the built-in allowlist is dropped, and `api.api_base_env`/`api.api_key_env` are never passed even if listed. An MCP server that needs its own key gets it through its `env` in `mcp_servers`. |
 | `budget.max_total_tokens` | stop the swarm once this many tokens are spent (0 = no cap) |
 | `ceiling` | the most power the orchestrator may grant |
 | `mcp_servers` | MCP servers available to grant |

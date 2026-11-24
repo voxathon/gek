@@ -22,6 +22,30 @@ if TYPE_CHECKING:
 
 CONTEXT_SOFT_LIMIT = 250_000  # chars; older tool outputs get elided past this
 
+# What an agent's shell command inherits from the harness environment. Nothing else gets through:
+# os.environ holds the API key and the harness's own settings.
+SHELL_ENV_NAMES = frozenset((
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR", "TEMP", "TMP",
+    "SYSTEMROOT", "COMSPEC", "PATHEXT", "VIRTUAL_ENV",
+))
+SHELL_ENV_PREFIXES = ("LC_", "UV_")
+
+
+def safe_env(cfg) -> dict[str, str]:
+    """The harness env, reduced to the allowlist plus agents.env_passthrough, minus credentials.
+    Used for agent shell commands and as the base env of MCP servers agents connect to."""
+    extra = cfg.section("agents").get("env_passthrough") or []
+    env = {k: v for k, v in os.environ.items()
+           if k in SHELL_ENV_NAMES or k.startswith(SHELL_ENV_PREFIXES) or k in extra}
+    return strip_credentials(cfg, env)
+
+
+def strip_credentials(cfg, env: dict[str, str]) -> dict[str, str]:
+    api = cfg.section("api")
+    for name in (api.get("api_base_env") or "GEK_API_BASE", api.get("api_key_env") or "GEK_API_KEY"):
+        env.pop(name, None)  # last, so no rule can let a credential back in
+    return env
+
 
 @dataclass
 class AgentHandle:
@@ -180,13 +204,19 @@ class Agent:
                              files=changed)
         return f"committed {sha[:10]} on {self.h.branch} ({len(changed)} paths)"
 
-    async def t_run(self, command: str, timeout_s: int | None = None) -> str:
-        limit = min(timeout_s or 10**9, self.swarm.cfg.section("agents").get("shell_timeout_s", 180))
+    def _shell_env(self) -> dict[str, str]:
+        """The environment for a run-tool command: an allowlist of the harness env plus the values
+        gek sets itself, and never the API credentials."""
+        env = safe_env(self.swarm.cfg)
         # shell git commits get the agent's identity too (otherwise they show up as the OS user)
-        env = dict(os.environ)
         env.update(GIT_AUTHOR_NAME=self.ident.name, GIT_AUTHOR_EMAIL=self.ident.email,
                    GIT_COMMITTER_NAME=self.ident.name, GIT_COMMITTER_EMAIL=self.ident.email,
                    GEK_AGENT=self.h.id, GEK_ROLE=self.h.role.name, GEK_BRANCH=self.h.branch)
+        return strip_credentials(self.swarm.cfg, env)
+
+    async def t_run(self, command: str, timeout_s: int | None = None) -> str:
+        limit = min(timeout_s or 10**9, self.swarm.cfg.section("agents").get("shell_timeout_s", 180))
+        env = self._shell_env()
         proc = await asyncio.create_subprocess_shell(
             command, cwd=str(self.h.worktree), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT, env=env)
@@ -271,7 +301,8 @@ class Agent:
         max_steps = h.role.max_steps or cfg.get("max_steps", 60)
         how = "max_steps"
         try:
-            await self.mcp.connect(h.role.powers.mcp, sw.cfg.raw.get("mcp_servers", {}))
+            await self.mcp.connect(h.role.powers.mcp, sw.cfg.raw.get("mcp_servers", {}),
+                                   base_env=safe_env(sw.cfg))
             self._build_tools()
             h.status = "running"
             model = sw.cfg.model(h.role.model or None)

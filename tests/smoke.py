@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,7 @@ def make_fake(swarm: Swarm):
             script = [
                 reply(call("write_file", path="src/hello.py", content="print('hello from the swarm')\n")),
                 reply(call("run", command="python3 src/hello.py || python src/hello.py")),
+                reply(call("run", command=f'"{sys.executable}" -c "import os; print(chr(10).join(f\'{{k}}={{v}}\' for k, v in os.environ.items()))"')),
                 reply(call("commit", message="add hello")),
                 reply(call("write_file", path="README.md", content="sneaky\n")),
                 reply(call("commit", message="sneak a readme")),
@@ -116,16 +118,22 @@ def make_fake(swarm: Swarm):
 
 
 async def main() -> int:
+    os.environ["GEK_API_KEY"] = "fake-key-should-never-reach-agent-shell"  # must never reach an agent shell
     tmp = Path(tempfile.mkdtemp(prefix="gek-smoke-"))
     cfg_path = tmp / "config.json"
     write_default_config(cfg_path, "Make a hello world program.")
     raw = json.loads(cfg_path.read_text())
     raw["orchestrator"].update(min_sleep_s=1, debounce_s=0.5, inbox_poll_s=0.5, default_sleep_s=5)
     srv = tmp / "calc_server.py"
-    srv.write_text("from mcp.server.mcpserver import MCPServer\nm = MCPServer('calc')\n"
+    srv.write_text("import os, pathlib\n"
+                   "pathlib.Path(os.environ['GEK_TEST_OUT']).write_text("
+                   "'leaked' if 'GEK_API_KEY' in os.environ else 'clean')\n"
+                   "from mcp.server.mcpserver import MCPServer\nm = MCPServer('calc')\n"
                    "@m.tool()\ndef add(a: int, b: int) -> int:\n    return a + b\n"
                    "@m.tool()\ndef secret() -> str:\n    return 'should be hidden'\nm.run()\n")
-    raw["mcp_servers"] = {"calc": {"command": sys.executable, "args": [str(srv)]}}
+    mcp_probe = tmp / "mcp_env_probe.txt"
+    raw["mcp_servers"] = {"calc": {"command": sys.executable, "args": [str(srv)],
+                                   "env": {"GEK_TEST_OUT": str(mcp_probe)}}}
     raw["ceiling"]["mcp"] = {"calc": ["add"]}
     cfg_path.write_text(json.dumps(raw, indent=2))
     cfg = load_config(cfg_path)
@@ -154,6 +162,8 @@ async def main() -> int:
     ev = [json.loads(l) for l in open(log.dir / "events.jsonl")]
     kinds = [e["kind"] for e in ev]
     exits = {e["actor"]: e["data"]["how"] for e in ev if e["kind"] == "agent_exit"}
+    run_outputs = [e["data"]["output"] for e in ev
+                   if e["kind"] == "tool_result" and e["data"]["name"] == "run"]
     checks = {
         "hello merged to main": hello is not None and "hello" in hello,
         "readme kept off main": "README.md" not in main_files,
@@ -168,6 +178,9 @@ async def main() -> int:
                                and e["data"]["output"].strip() == "42" for e in ev),
         "mcp secret hidden": all("secret" not in (e["data"].get("granted") or []) for e in ev if e["kind"] == "mcp"),
         "transcripts written": len(list((log.dir / "agents").glob("*.jsonl"))) >= 4,
+        "api key hidden from mcp servers": mcp_probe.exists() and mcp_probe.read_text() == "clean",
+        "api key hidden from agent shell": any("GEK_ROLE=" in o for o in run_outputs)
+                                           and not any("GEK_API_KEY" in o for o in run_outputs),
     }
     print(await explain(cfg))
     print("\nCHECKS")
