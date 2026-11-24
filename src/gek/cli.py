@@ -7,6 +7,8 @@
   gek run | explain | inbox MSG | where     act on the current swarm
   gek push REMOTE [BRANCH] [--to D]         push swarm work to a git URL or path
   gek kill AGENT [REASON] | halt [REASON]   steer a running swarm (handled within seconds)
+  gek spawn | role | config | mode | wake | pause | resume
+                                            the rest of the control plane (docs/CONTROL.md)
   gek tui [--web]                           dashboard in the terminal, or in a browser
   gek tui                                   watch every swarm: graphs, agents, live feed
 
@@ -252,14 +254,58 @@ async def _push(args: argparse.Namespace) -> int:
     return 0
 
 
-async def send_control(cfg: Config, who: str, control: str, reason: str) -> str:
+def control_message(who: str, control: str, reason: str = "", payload: str = "") -> str:
+    """The commit message format of docs/CONTROL.md: subject, optional payload, trailers."""
+    reason = " ".join(reason.split())
+    subject = f"{control}: {reason}" if reason else control
+    if len(subject) > 72:
+        subject = subject[:69] + "..."
+    parts = [subject]
+    if payload.strip():
+        parts.append(payload.strip())
+    trailers = [f"Control: {control}"] + ([f"Reason: {reason}"] if reason else []) + [f"From: {who}"]
+    parts.append("\n".join(trailers))
+    return "\n\n".join(parts) + "\n"
+
+
+async def send_control(cfg: Config, who: str, control: str, reason: str = "", payload: str = "") -> str:
     """Post a control commit to swarm/inbox; a running swarm acts on it within inbox_poll_s."""
-    from .swarm import _message
+    repo = Repo(cfg.repo_dir)
+    return await repo.empty_commit(INBOX, control_message(who, control, reason, payload),
+                                   Identity(who, f"{who}@outside.gek"), actor=who)
+
+
+def is_running(cfg: Config) -> bool:
+    info = _lock_info(cfg)
+    return bool(info and info.startswith("running"))
+
+
+async def _needs_running(cfg: Config, what: str) -> None:
+    if not is_running(cfg):
+        raise UserError(f"{cfg.name!r} isn't running; {what} needs a running swarm (gek run).")
+
+
+async def _role_offline(cfg: Config, who: str, data: dict | None, retire: str = "") -> str:
+    """Apply a role change straight to swarm/roles when no swarm is running."""
+    from .gitrepo import ROLES
+    from .roles import Role, validate
 
     repo = Repo(cfg.repo_dir)
-    return await repo.empty_commit(INBOX, _message(f"{control}: {reason}" if reason else control,
-                                                   {"Control": control, "From": who}),
-                                   Identity(who, f"{who}@outside.gek"), actor=who)
+    ident = Identity(who, f"{who}@outside.gek")
+    if retire:
+        if not await repo.read_file_at(ROLES, f"roles/{retire}.json"):
+            raise UserError(f"no role {retire!r}")
+        await repo.write_files_commit(ROLES, {f"roles/{retire}.json": None},
+                                      f"{who}: retire role {retire}\n\nRetired: {retire}\n", ident, actor=who)
+        return f"role {retire} retired"
+    role = Role.from_dict(data or {})
+    errs = validate(role, cfg.raw.get("ceiling", {}), cfg.raw.get("mcp_servers", {}))
+    if errs:
+        raise UserError("role rejected:\n- " + "\n- ".join(errs))
+    await repo.write_files_commit(ROLES, {f"roles/{role.name}.json": role.to_json()},
+                                  f"{who}: set role {role.name}\n\nRole-Template: {role.name}\n",
+                                  ident, actor=who)
+    return f"role {role.name} written"
 
 
 async def _kill(args: argparse.Namespace) -> int:
@@ -275,6 +321,142 @@ async def _halt(args: argparse.Namespace) -> int:
     sha = await send_control(cfg, args.sender, "halt", args.reason)
     note = "" if _lock_info(cfg) else " (swarm isn't running)"
     print(f"sent halt to {cfg.name}: {sha[:10]}{note}")
+    return 0
+
+
+def _sent(cfg: Config, what: str, sha: str) -> None:
+    print(f"sent {what} to {cfg.name} ({sha[:10]}); the running swarm acts on it within a few seconds")
+
+
+async def _spawn(args: argparse.Namespace) -> int:
+    cfg = resolve(args)
+    await _needs_running(cfg, "spawn")
+    control = f"spawn {args.role}" + (f" from={args.from_branch}" if args.from_branch else "")
+    _sent(cfg, control, await send_control(cfg, args.sender, control, "", args.note or ""))
+    return 0
+
+
+async def _wake(args: argparse.Namespace) -> int:
+    cfg = resolve(args)
+    await _needs_running(cfg, "wake")
+    _sent(cfg, "wake", await send_control(cfg, args.sender, "wake", args.reason or "woken by hand"))
+    return 0
+
+
+async def _pause(args: argparse.Namespace) -> int:
+    cfg = resolve(args)
+    verb = args.cmd
+    await _needs_running(cfg, verb)
+    _sent(cfg, verb, await send_control(cfg, args.sender, verb, args.reason or ""))
+    return 0
+
+
+async def _mode(args: argparse.Namespace) -> int:
+    from .config import persist_key
+
+    cfg = resolve(args)
+    if is_running(cfg):
+        _sent(cfg, f"mode {args.mode}", await send_control(cfg, args.sender, f"mode {args.mode}", args.reason or ""))
+    else:
+        persist_key(cfg.path, "orchestrator.mode", args.mode)
+        print(f"{cfg.name}: orchestrator.mode = {args.mode} (applies on the next run)")
+    return 0
+
+
+async def _config(args: argparse.Namespace) -> int:
+    from .config import flatten, get_path, is_hot, parse_value, persist_key
+
+    cfg = resolve(args)
+    if args.action == "get":
+        if args.key:
+            print(json.dumps(get_path(cfg.raw, args.key), indent=2))
+        else:
+            for k, v in sorted(flatten(cfg.raw).items()):
+                tag = "" if is_hot(k) else "   (restart)"
+                print(f"{k} = {json.dumps(v)}{tag}")
+        return 0
+    if not args.key or args.value is None:
+        raise UserError("usage: gek config set KEY VALUE   (VALUE is JSON: 3, true, \"text\", [..], {..})")
+    if not is_hot(args.key):
+        raise UserError(f"{args.key} needs a restart; edit {cfg.path} and restart the swarm")
+    value = parse_value(args.value)
+    old = get_path(cfg.raw, args.key)
+    if args.key.startswith("ceiling") and not args.yes:
+        prompt = (f"Change the ceiling {args.key}: {json.dumps(old)} -> {json.dumps(value)}? "
+                  "This changes what the swarm may grant. [y/N] ")
+        if not sys.stdin.isatty() or input(prompt).strip().lower() not in ("y", "yes"):
+            raise UserError("not changed (pass --yes to skip the question)")
+    if is_running(cfg):
+        _sent(cfg, f"config set {args.key}", await send_control(
+            cfg, args.sender, f"config set {args.key}", args.reason or "", json.dumps(value)))
+    else:
+        persist_key(cfg.path, args.key, value)
+        print(f"{cfg.name}: {args.key} = {json.dumps(value)} (was {json.dumps(old)}; applies on the next run)")
+    return 0
+
+
+async def _role(args: argparse.Namespace) -> int:
+    import os as _os
+    import subprocess
+    import tempfile
+
+    from .gitrepo import ROLES
+    from .roles import Role, validate
+
+    cfg = resolve(args)
+    repo = Repo(cfg.repo_dir)
+    if args.action == "list":
+        names = [Path(p).stem for p in await repo.list_files_at(ROLES, "roles")]
+        print("\n".join(names) or "(no roles)")
+        return 0
+    if args.action == "show":
+        text = await repo.read_file_at(ROLES, f"roles/{args.name}.json")
+        if not text:
+            raise UserError(f"no role {args.name!r}")
+        print(text)
+        return 0
+    if args.action == "retire":
+        if not args.name:
+            raise UserError("usage: gek role retire NAME [REASON]")
+        if is_running(cfg):
+            _sent(cfg, f"role retire {args.name}",
+                  await send_control(cfg, args.sender, f"role retire {args.name}", args.reason or ""))
+        else:
+            print(await _role_offline(cfg, args.sender, None, retire=args.name))
+        return 0
+    # set (from a file or stdin) or edit (in $EDITOR)
+    if args.action == "set":
+        src = args.name or "-"
+        text = sys.stdin.read() if src == "-" else Path(src).read_text(encoding="utf-8")
+    else:
+        if not args.name:
+            raise UserError("usage: gek role edit NAME")
+        current = await repo.read_file_at(ROLES, f"roles/{args.name}.json")
+        start = current or Role(name=args.name, mandate="what this role is for").to_json()
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            f.write(start)
+            tmp = f.name
+        editor = _os.environ.get("VISUAL") or _os.environ.get("EDITOR") or (
+            "notepad" if _os.name == "nt" else "nano")
+        subprocess.call(f'{editor} "{tmp}"', shell=True)
+        text = Path(tmp).read_text(encoding="utf-8")
+        _os.unlink(tmp)
+        if text.strip() == start.strip():
+            print("unchanged")
+            return 0
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise UserError(f"not valid JSON: {e}")
+    errs = validate(Role.from_dict(data), cfg.raw.get("ceiling", {}), cfg.raw.get("mcp_servers", {}))
+    if errs:
+        raise UserError("role rejected:\n- " + "\n- ".join(errs))
+    if is_running(cfg):
+        _sent(cfg, f"role set {data.get('name')}",
+              await send_control(cfg, args.sender, "role set", args.reason or f"set {data.get('name')}",
+                                 json.dumps(data, indent=2)))
+    else:
+        print(await _role_offline(cfg, args.sender, data))
     return 0
 
 
@@ -350,6 +532,46 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--public-url", default=None,
                    help="URL the browser uses, e.g. http://10.0.0.15:8000 (needed with --host 0.0.0.0)")
     s.set_defaults(fn=None)
+
+    s = sub.add_parser("spawn", help="spawn an agent into a role (running swarm)")
+    s.add_argument("role")
+    s.add_argument("note", nargs="?", default="", help="what the agent should focus on")
+    s.add_argument("--from", dest="from_branch", default="", help="start from this branch, e.g. a dead agent's")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_spawn)
+
+    s = sub.add_parser("role", help="list, show, edit, set or retire role templates")
+    s.add_argument("action", choices=["list", "show", "edit", "set", "retire"])
+    s.add_argument("name", nargs="?", default="", help="role name (for set: a JSON file, or - for stdin)")
+    s.add_argument("reason", nargs="?", default="")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_role)
+
+    s = sub.add_parser("config", help="get or set live settings (applied without restarting)")
+    s.add_argument("action", choices=["get", "set"])
+    s.add_argument("key", nargs="?", default="")
+    s.add_argument("value", nargs="?", default=None, help="JSON: 3, true, \"text\", [..], {..}")
+    s.add_argument("--yes", action="store_true", help="don't ask before changing the ceiling")
+    s.add_argument("--reason", default="")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_config)
+
+    s = sub.add_parser("mode", help="who orchestrates: llm or human")
+    s.add_argument("mode", choices=["llm", "human"])
+    s.add_argument("reason", nargs="?", default="")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_mode)
+
+    s = sub.add_parser("wake", help="wake the orchestrator now")
+    s.add_argument("reason", nargs="?", default="")
+    s.add_argument("--as", dest="sender", default="human")
+    s.set_defaults(fn=_wake)
+
+    for verb, helptext in (("pause", "freeze the swarm (nothing is killed)"), ("resume", "unfreeze the swarm")):
+        s = sub.add_parser(verb, help=helptext)
+        s.add_argument("reason", nargs="?", default="")
+        s.add_argument("--as", dest="sender", default="human")
+        s.set_defaults(fn=_pause)
 
     s = sub.add_parser("kill", help="kill a live agent of the running swarm, on the record")
     s.add_argument("agent", help="agent id, e.g. coder/ab12")

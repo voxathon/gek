@@ -17,6 +17,7 @@ from .gitrepo import CHATTER, INBOX, MAIN, ROLES, Identity, Repo
 from .llm import LLM, BudgetExceeded
 from .logs import RunLog
 from .prompts import ORCHESTRATOR_PRIOR
+from .config import flatten, get_path, is_hot, parse_value, persist_key, set_path
 from .roles import Role, validate
 from .tools import B, I, S, ToolBox, arr, obj
 
@@ -53,6 +54,75 @@ class Swarm:
         self.wakes = 0
         self.started: float = 0.0
         self.orch_ident = Identity("orchestrator", "orchestrator@swarm.gek")
+        self.resumed = asyncio.Event()  # cleared while paused; agents wait on it between steps
+        self.resumed.set()
+        self.outside: list[str] = []  # outside actions since the orchestrator's last wake
+        self._cfg_mtime = self._mtime()
+
+    # ------------------------------------------------------- control plane
+    @property
+    def mode(self) -> str:
+        return str(self.cfg.section("orchestrator").get("mode") or "llm")
+
+    @property
+    def paused(self) -> bool:
+        return not self.resumed.is_set()
+
+    def _mtime(self) -> float:
+        try:
+            return self.cfg.path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    async def apply_config(self, key: str, value: Any, author: str, persist: bool = True) -> str:
+        """Change one live setting. Returns a result line; raises ValueError when refused."""
+        if not is_hot(key):
+            raise ValueError(f"{key} needs a restart (not a live setting)")
+        old = get_path(self.cfg.raw, key)
+        if old == value:
+            return f"{key} already {json.dumps(value)}"
+        set_path(self.cfg.raw, key, value)
+        if persist:
+            persist_key(self.cfg.path, key, value)
+            self._cfg_mtime = self._mtime()
+        self.log.event("config", author, key=key, old=old, new=value)
+        line = f"{key}: {json.dumps(old)} -> {json.dumps(value)}"
+        if key == "goal":
+            self.goal = str(value)
+        if key.startswith("ceiling"):
+            bad = []
+            for r in self.roles.values():
+                errs = validate(r, self.cfg.raw.get("ceiling", {}), self.cfg.raw.get("mcp_servers", {}))
+                if errs:
+                    bad.append(f"{r.name} ({'; '.join(errs)})")
+            if bad:
+                line += ". Roles now above the ceiling (live agents keep their powers): " + ", ".join(bad)
+                self.log.event("note", "harness", roles_above_ceiling=bad)
+        if key == "orchestrator.mode" or (key == "orchestrator" and isinstance(value, dict)):
+            self.log.event("mode", author, mode=self.mode)
+            if self.mode == "llm":
+                self.request_wake(f"{author} switched to llm mode")
+        return line
+
+    async def _reload_config_file(self) -> None:
+        """config.json changed on disk (a hand edit): apply the hot keys that differ."""
+        from .config import load_config
+
+        self._cfg_mtime = self._mtime()
+        try:
+            fresh = load_config(self.cfg.path, name=self.cfg.name, portable=self.cfg.portable).raw
+        except Exception as e:
+            self.log.event("note", "file", error=f"config.json changed but can't be read: {e}")
+            return
+        old_flat, new_flat = flatten(self.cfg.raw), flatten(fresh)
+        for key in sorted(set(old_flat) | set(new_flat)):
+            if old_flat.get(key) == new_flat.get(key):
+                continue
+            try:
+                line = await self.apply_config(key, get_path(fresh, key), "file", persist=False)
+                self.outside.append(f"config.json edited by hand: {line}")
+            except ValueError as e:
+                self.log.event("config", "file", key=key, refused=str(e))
 
     # -------------------------------------------------------------- helpers
     async def post(self, ref: str, actor: str, message: str, trailers: dict[str, str] | None = None) -> str:
@@ -293,10 +363,13 @@ class Swarm:
                 f"{int(me.get('calls', 0))} calls. Run time {elapsed:.1f} min, wake {self.wakes}.\n"
                 + (f"Environment notes (agents see these too):\n{notes}\n" if notes else "")
                 + "\n"
-                f"Role templates:\n{self.describe_roles()}\n\n"
+                + (("Outside actions since your last wake (a human or another client; authoritative):\n"
+                    + "\n".join(f"- {o}" for o in self.outside) + "\n\n") if self.outside else "")
+                + f"Role templates:\n{self.describe_roles()}\n\n"
                 f"Agents:\n{self.describe_agents()}\n\n"
                 f"Git log {'since your last wake' if since else '(everything)'}:\n{log_since}\n")},
         ]
+        self.outside = []
         for m in messages:
             self.log.transcript(ORCH, {**m, "wake": self.wakes})
         tools = box.schemas()
@@ -333,9 +406,12 @@ class Swarm:
         a `Control:` trailer are handled by the harness itself: `kill <agent>` or `halt`."""
         poll = self.cfg.section("orchestrator").get("inbox_poll_s", 5)
         last = await self.repo.tip(INBOX)
-        fmt = "%H%x1f%an%x1f%(trailers:key=Control,valueonly,separator=%x2c)%x1f%B%x1e"
+        fmt = ("%H%x1f%an%x1f%(trailers:key=Control,valueonly,separator=%x2c)%x1f"
+               "%(trailers:key=Reason,valueonly,separator=%x20)%x1f%s%x1f%b%x1e")
         while True:
-            await asyncio.sleep(poll)
+            await asyncio.sleep(self.cfg.section("orchestrator").get("inbox_poll_s", poll))
+            if self._mtime() != self._cfg_mtime:
+                await self._reload_config_file()
             tip = await self.repo.tip(INBOX)
             if not tip or tip == last:
                 continue
@@ -345,30 +421,94 @@ class Swarm:
             for rec in out.split("\x1e"):
                 if not rec.strip():
                     continue
-                sha, author, control, body = (rec.strip("\n").split("\x1f") + [""] * 4)[:4]
+                sha, author, control, reason, subject, body = (rec.strip("\n").split("\x1f") + [""] * 6)[:6]
                 if author in self.agents or author in (ORCH, "gek"):
                     continue  # in-process posts already woke us
                 control = control.strip()
                 if control:
-                    await self._control(author, control, body.strip(), sha)
+                    # payload = body minus the trailer paragraph
+                    paras = [p for p in body.strip().split("\n\n")]
+                    if paras and any(l.startswith("Control:") for l in paras[-1].splitlines()):
+                        paras = paras[:-1]
+                    await self._control(author, control, reason.strip() or subject.strip(),
+                                        "\n\n".join(paras).strip(), sha)
                 else:
-                    self.log.event("inbox", author, message=body.strip(), sha=sha, external=True)
+                    message = (subject + ("\n\n" + body if body.strip() else "")).strip()
+                    self.log.event("inbox", author, message=message, sha=sha, external=True)
                     self.request_wake(f"inbox from {author}")
 
-    async def _control(self, author: str, control: str, body: str, sha: str) -> None:
-        verb, _, arg = control.partition(" ")
-        reason = body.split("\n\n")[0].strip() or control
-        self.log.event("control", author, verb=verb, arg=arg.strip(), reason=reason, sha=sha)
-        if verb == "kill":
-            res = await self.kill(arg.strip(), author, reason)
-            self.log.event("note", author, control_result=res)
-            if not res.startswith("ERROR"):
-                self.request_wake(f"{author} killed {arg.strip()}")
-        elif verb == "halt":
-            self.halted = f"halted by {author}: {reason}"
-            self.request_wake(f"halt by {author}")
-        else:
-            self.log.event("note", author, error=f"unknown control {control!r}")
+    async def _control(self, author: str, control: str, reason: str, payload: str, sha: str) -> None:
+        """Carry out one Control: command (docs/CONTROL.md)."""
+        verb, _, arg = control.strip().partition(" ")
+        arg = arg.strip()
+        reason = reason or control
+        ok, result = True, ""
+        try:
+            if verb == "kill":
+                result = await self.kill(arg, author, reason)
+                if not result.startswith("ERROR"):
+                    self.request_wake(f"{author} killed {arg}")
+            elif verb == "halt":
+                self.halted = f"halted by {author}: {reason}"
+                self.resumed.set()
+                self.request_wake(f"halt by {author}")
+                result = "halting"
+            elif verb == "wake":
+                self.request_wake(f"{author} asked: {reason}")
+                result = "wake requested" + (" (human mode: you'll get a notice, no model call)"
+                                             if self.mode == "human" else "")
+            elif verb == "spawn":
+                role, _, rest = arg.partition(" ")
+                frm = rest.strip()[5:] if rest.strip().startswith("from=") else ""
+                note = payload or (reason if reason != control else "")
+                result = await self.spawn(role, note=note, resume_branch=frm, actor=author)
+            elif verb == "role" and arg == "set":
+                text = payload[payload.find("{"): payload.rfind("}") + 1]
+                if not text:
+                    raise ValueError("role set needs the template as JSON in the body")
+                result = await self.write_role(json.loads(text), actor=author)
+            elif verb == "role" and arg.startswith("retire"):
+                result = await self.retire_role(arg[6:].strip(), reason, actor=author)
+            elif verb == "config" and arg.startswith("set "):
+                key = arg[4:].strip()
+                if not payload:
+                    raise ValueError("config set needs the value (JSON) in the body")
+                value = parse_value(payload)
+                result = await self.apply_config(key, value, author)
+            elif verb == "mode" and arg in ("llm", "human"):
+                result = await self.apply_config("orchestrator.mode", arg, author)
+            elif verb == "pause":
+                if self.paused:
+                    result = "already paused"
+                else:
+                    self.resumed.clear()
+                    self.log.event("pause", author, paused=True, reason=reason)
+                    result = "paused: the orchestrator won't wake, agents wait after their current step"
+            elif verb == "resume":
+                if not self.paused:
+                    result = "not paused"
+                else:
+                    self.resumed.set()
+                    self.log.event("pause", author, paused=False, reason=reason)
+                    self.request_wake(f"{author} resumed the swarm")
+                    result = "resumed"
+            else:
+                raise ValueError(f"unknown control {control!r} (see docs/CONTROL.md)")
+            if str(result).startswith("ERROR"):
+                ok = False
+        except Exception as e:
+            ok, result = False, f"ERROR: {type(e).__name__}: {e}"
+        self.log.event("control", author, verb=verb, arg=arg, reason=reason, sha=sha, ok=ok,
+                       result=str(result)[:2000])
+        line = (f"{author}: {control}" + (f" ({reason})" if reason and reason != control else "")
+                + f" -> {str(result)[:300]}")
+        self.outside.append(line)
+        if not ok:
+            try:
+                await self.post(CHATTER, "harness", f"control from {author} failed: {control}: {result}",
+                                {"Control-Failed": control})
+            except Exception:
+                pass
 
     async def run(self) -> str:
         ocfg = self.cfg.section("orchestrator")
@@ -384,11 +524,31 @@ class Swarm:
         reasons = ["start"]
         try:
             while not self.halted:
+                ocfg = self.cfg.section("orchestrator")  # live config: re-read every loop
                 # Clear wake requests *before* the wake, not after: anything that arrives while
                 # the orchestrator is awake (an inbox message, an agent exiting) must still
                 # cause another wake once this one sleeps.
                 self.wake.clear()
                 self.wake_reasons = []
+                if self.paused:
+                    await self.resumed.wait()
+                    if self.halted:
+                        break
+                    reasons = ["resumed"] + reasons
+                    self.wake.clear()
+                    self.wake_reasons = []
+                if self.mode == "human":
+                    # no model call: the wake becomes a notice for the human
+                    self.last_wake = time.time()
+                    self.log.event("human_wake", "harness", reasons=reasons,
+                                   outside=self.outside[-20:], alive=[a.id for a in self.alive()])
+                    self.outside = self.outside[-50:]  # kept for the model when you hand back
+                    await self.wake.wait()
+                    if self.halted:
+                        break
+                    await asyncio.sleep(ocfg.get("debounce_s", 10))
+                    reasons = list(dict.fromkeys(self.wake_reasons)) or ["interrupt"]
+                    continue
                 try:
                     secs, _ = await self._orch_wake(reasons)
                 except BudgetExceeded as e:
@@ -403,6 +563,7 @@ class Swarm:
                 if self.halted:
                     break
                 try:
+                    ocfg = self.cfg.section("orchestrator")
                     await asyncio.wait_for(self.wake.wait(), timeout=secs)
                     # interrupted: debounce, and never wake twice within min_sleep
                     await asyncio.sleep(ocfg.get("debounce_s", 10))

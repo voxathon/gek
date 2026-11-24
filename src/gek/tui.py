@@ -67,6 +67,8 @@ class RunData:
     feed: deque = field(default_factory=lambda: deque(maxlen=2000))
     view_end: float | None = None  # x-axis end: now for a live run, last event otherwise
     wake_list: list[tuple[float, int, str]] = field(default_factory=list)  # (t, n, why)
+    mode: str = "llm"
+    paused: bool = False
     new_feed: list[str] = field(default_factory=list)
     _partial: str = ""
 
@@ -113,6 +115,10 @@ class RunData:
             self.goal = d.get("goal", "")
         elif k == "run_end":
             self.ended = d.get("reason", "?")
+        elif k == "mode":
+            self.mode = d.get("mode", self.mode)
+        elif k == "pause":
+            self.paused = bool(d.get("paused"))
         elif k == "orch_wake":
             self.wakes = d.get("n", self.wakes + 1)
             self.wake_list.append((t, self.wakes, ", ".join(d.get("reasons") or []) or "?"))
@@ -668,7 +674,8 @@ class GekTUI(App):
             live = running_run(self.cfg) == run.path.parent.name and run.ended is None
             reason = " ".join((run.ended or "").split())
             reason = reason if len(reason) <= 70 else reason[:67] + "..."
-            status = "[green]RUNNING[/green]" if live else (
+            status = ("[green]RUNNING[/green]" + (" [yellow]PAUSED[/yellow]" if run.paused else "")
+                      + (" [cyan]human mode[/cyan]" if run.mode == "human" else "")) if live else (
                 f"ended: {escape(reason)}" if run.ended else "[yellow]no run_end (crashed or killed)[/yellow]")
             end = time.time() if live else (run.t_last or 0)
             mins = (end - (run.t0 or end)) / 60

@@ -113,6 +113,29 @@ Pick a swarm other than the current one with `-s NAME` (or `-c path/to/config.js
 before the command: `gek -s tui explain`. `--seed` clones an existing repo; its
 default branch becomes `main`.
 
+## Control plane
+
+Everything that steers a swarm is a commit on its `swarm/inbox` branch with a `Control:` trailer,
+written by whoever sends it (see [docs/CONTROL.md](docs/CONTROL.md) for the full protocol). The CLI,
+the TUI and any other client use the same channel, so every action is on the record with a name.
+
+| Command | What it does |
+| --- | --- |
+| `gek spawn ROLE [NOTE] [--from BRANCH]` | spawn an agent into a role |
+| `gek role list / show NAME / edit NAME / set FILE\|- / retire NAME` | manage role templates (`edit` opens `$EDITOR`; validated against the ceiling) |
+| `gek config get [KEY]` / `gek config set KEY VALUE` | read or change settings live; VALUE is JSON. Ceiling changes ask first (`--yes` to skip). Restart-only keys are refused. |
+| `gek mode human\|llm` | who orchestrates. `human`: the model isn't called; wakes become notices in the feed and TUI. |
+| `gek wake [REASON]` | wake the orchestrator now |
+| `gek pause` / `gek resume` | freeze and unfreeze the swarm; agents finish their current step and wait |
+| `gek kill AGENT [REASON]` / `gek halt [REASON]` | kill one agent / stop the swarm |
+| `gek inbox "message"` | a plain message to the orchestrator |
+
+Live settings take effect without a restart, are saved to the swarm's `config.json`, and show up
+in the orchestrator's next briefing. Editing `config.json` by hand while the swarm runs works too.
+When no swarm is running, `role`, `config` and `mode` change the files directly for the next run;
+the rest need a running swarm. The orchestrator is told every outside action and treats them as
+authoritative.
+
 ## TUI
 
 ```
@@ -283,6 +306,8 @@ src/gek/
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
 tests/control.py  gek kill / halt / inbox against a running swarm, gek push
+tests/controlplane.py  the whole control plane through the real CLI (docs/CONTROL.md)
+docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
 ## Publishing
@@ -300,6 +325,7 @@ Bump `version` in pyproject.toml and `__version__` in `src/gek/__init__.py` toge
 uv run python tests/smoke.py
 uv run python tests/limits.py
 uv run python tests/control.py
+uv run python tests/controlplane.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

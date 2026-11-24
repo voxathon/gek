@@ -327,14 +327,20 @@ class Agent:
                 f"You have just been spawned. Note from the orchestrator: {h.note or '(none)'}\n\n"
                 f"Recent chatter:\n{chatter}\n\nRecent main:\n{mainlog}\n\nBegin.")})
             tools = self.box.schemas()
-            every = max(1, int(cfg.get("status_every_steps", 5)))
-            for step in range(max_steps):
+            while True:
+                # caps are re-read every step, so live config changes apply to running agents
+                cfg = sw.cfg.section("agents")
+                every = max(1, int(cfg.get("status_every_steps", 5)))
+                max_steps = h.role.max_steps or cfg.get("max_steps", 60)
+                if h.steps >= max_steps:
+                    break
+                await sw.resumed.wait()  # paused swarms hold here, between steps
                 used = sw.llm.actor_tokens(h.id)
                 if max_tokens and used >= max_tokens:
                     how = "token_cap"
                     h.summary = f"stopped at the role's token cap ({used:,} of {max_tokens:,})"
                     break
-                h.steps = step + 1
+                h.steps += 1
                 self._elide()
                 msg = await sw.llm.chat(h.id, model, self.messages, tools)
                 self._record(msg)

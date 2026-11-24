@@ -42,7 +42,11 @@ EVENT_KINDS = {
     "commit": "a commit landed on some ref; data has ref, sha, message",
     "merge": "a branch was merged to main, or a merge hit conflicts",
     "inbox": "a message arrived on swarm/inbox",
-    "control": "a kill or halt arrived from outside (gek kill/halt, the TUI); data has verb, arg, reason",
+    "control": "a command arrived on swarm/inbox (docs/CONTROL.md); data has verb, arg, reason, ok, result",
+    "config": "a live setting changed; data has key, old, new (or refused)",
+    "mode": "who orchestrates changed: llm or human",
+    "pause": "the swarm was paused or resumed",
+    "human_wake": "a wake in human mode: no model call; data has reasons and outside actions",
     "mcp": "an MCP server connected, failed, or listed tools",
     "budget": "token totals crossed a threshold or the budget ran out",
     "note": "anything else worth knowing",
@@ -135,7 +139,19 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
         tag = "says" if d.get("name") == "post" else "interrupts"
         return f"  ~  {actor} {tag}: {_clip((d.get('args') or {}).get('message'), 150)}"
     if kind == "control":
-        return f"  !! {actor} sent {d.get('verb')} {d.get('arg') or ''}: {_clip(d.get('reason'), 120)}"
+        mark = "!!" if d.get("ok", True) else "XX"
+        return (f"  {mark} {actor} sent {d.get('verb')} {d.get('arg') or ''}: {_clip(d.get('reason'), 80)}"
+                f" -> {_clip(d.get('result'), 100)}")
+    if kind == "config":
+        if d.get("refused"):
+            return f"  x  config {d.get('key')} refused: {_clip(d.get('refused'))}"
+        return f"  =  {actor} set {d.get('key')}: {_clip(json.dumps(d.get('old')), 40)} -> {_clip(json.dumps(d.get('new')), 60)}"
+    if kind == "mode":
+        return f"[orchestrator] mode is now {d.get('mode')} (by {actor})"
+    if kind == "pause":
+        return f"  || swarm {'paused' if d.get('paused') else 'resumed'} by {actor}: {_clip(d.get('reason'))}"
+    if kind == "human_wake":
+        return f"[you] the orchestrator would wake (human mode): {', '.join(d.get('reasons') or [])}"
     if kind == "inbox" and d.get("external"):
         return f"  @  inbox from {actor}: {_clip(d.get('message'), 150)}"
     if kind == "llm_error":

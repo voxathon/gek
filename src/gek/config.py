@@ -62,6 +62,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_steps_per_wake": 30,
         "log_chars_per_wake": 30000,
         "wake_on_agent_exit": True,
+        "mode": "llm",
     },
     "agents": {
         "max_alive": 6,
@@ -281,3 +282,70 @@ ENV_TEMPLATE = """\
 GEK_API_BASE=https://app.vllm-sr.ai/v1
 GEK_API_KEY=put-your-key-here
 """
+
+
+# ---------------------------------------------------------------- live config
+HOT_PREFIXES = (
+    "goal", "budget.", "ceiling.", "ceiling", "models.default", "models.orchestrator",
+    "models.aliases", "models.pricing", "mcp_servers", "llm.temperature", "llm.timeout_s",
+    "llm.num_retries", "llm.extra_params", "agents.", "orchestrator.",
+)
+COLD_PREFIXES = ("swarm_dir", "api")
+
+
+def is_hot(key: str) -> bool:
+    if any(key == c or key.startswith(c + ".") for c in COLD_PREFIXES):
+        return False
+    return any(key == p.rstrip(".") or key.startswith(p if p.endswith(".") else p + ".")
+               or key == p for p in HOT_PREFIXES)
+
+
+def get_path(raw: dict[str, Any], key: str, default: Any = None) -> Any:
+    node: Any = raw
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def set_path(raw: dict[str, Any], key: str, value: Any) -> None:
+    parts = key.split(".")
+    node = raw
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            node[part] = {}
+        node = node[part]
+    node[parts[-1]] = value
+
+
+def flatten(raw: Any, prefix: str = "") -> dict[str, Any]:
+    """Leaf values by dotted key (dicts are walked; lists and scalars are leaves)."""
+    if not isinstance(raw, dict) or not raw:
+        return {prefix: raw} if prefix else {}
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if str(k).startswith("_"):
+            continue
+        out.update(flatten(v, f"{prefix}.{k}" if prefix else str(k)))
+    return out
+
+
+def parse_value(text: str) -> Any:
+    """CLI/control values are JSON (3, true, "x", [..], {..}); anything else is a plain string."""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def persist_key(path: Path, key: str, value: Any) -> None:
+    """Write one key into a config.json file, keeping everything else in it."""
+    data: dict[str, Any] = {}
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    set_path(data, key, value)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
