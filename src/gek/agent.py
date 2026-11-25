@@ -133,13 +133,13 @@ class Agent:
                   obj(["agent_id", "reason"], agent_id=S, reason=S), self.t_kill)
         b.add("finish", "End yourself. Call when your work is done or you are stuck for good. "
               "Commit first: uncommitted work is lost.", obj(["summary"], summary=S), self.t_finish)
-        b.extra_schemas = self.mcp.schemas
-        b.fallback = self._mcp_call
-
-    async def _mcp_call(self, name: str, args: dict[str, Any]) -> str:
-        if name in self.mcp.tools:
-            return await self.mcp.call(name, args)
-        return f"ERROR: no tool named {name!r}"
+        for t in self.mcp.listed:
+            b.add_tool(t)
+        host = getattr(self.swarm, "plugins", None)
+        if host is not None:
+            for t in host.tools_for(self):
+                b.add_tool(t)
+        self.swarm.log.event("tools", self.h.id, sources=b.sources())
 
     async def t_read_log(self, refs: list[str] | None = None, since_minutes: int | None = None,
                          limit: int = 50) -> str:
@@ -232,7 +232,7 @@ class Agent:
             from .sandbox import hidden_roots
 
             argv = sb.argv(command, Path(self.h.worktree).resolve(), self.swarm.cfg.repo_dir.resolve(),
-                           hidden_roots(self.swarm.cfg))
+                           hidden_roots(self.swarm.cfg), branch=self.h.branch)
             proc = await asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=sb.env(env))
         else:

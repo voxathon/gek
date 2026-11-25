@@ -85,8 +85,11 @@ class Sandbox:
                    TMPDIR="/tmp")
         return env
 
-    def argv(self, command: str, worktree: Path, git_dir: Path, hidden_roots: list[Path]) -> list[str]:
-        """The full argv for one sandboxed `run` command."""
+    def argv(self, command: str, worktree: Path, git_dir: Path, hidden_roots: list[Path],
+             branch: str = "") -> list[str]:
+        """The full argv for one sandboxed `run` command. The swarm's git repo is read-only
+        except what this agent's commits need, so a shell can't forge commits on swarm/inbox
+        (Control: commands) or move other agents' branches."""
         a = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
              "--tmpfs", "/tmp", "--unshare-all", "--die-with-parent", "--new-session"]
         if self.network:
@@ -99,11 +102,36 @@ class Sandbox:
         for p in hidden_roots:          # gek home, the swarm folder: tmpfs over them...
             if p.exists():
                 a += ["--tmpfs", str(p)]
-        for p in [git_dir, worktree, *( [self.cache] if self.cache else [] ), *self.writable]:
-            if p.exists():               # ...then the bits the agent needs, bound back on top
+        if git_dir.exists():             # ...then the bits the agent needs, bound back on top
+            a += ["--ro-bind", str(git_dir), str(git_dir)]
+        for p in [*git_writable(worktree, git_dir, branch), worktree,
+                  *([self.cache] if self.cache else []), *self.writable]:
+            if p.exists():
                 a += ["--bind", str(p), str(p)]
         a += ["--chdir", str(worktree), "--", "/bin/sh", "-c", command]
         return a
+
+
+def git_writable(worktree: Path, git_dir: Path, branch: str) -> list[Path]:
+    """What a commit on `branch` from `worktree` writes inside the bare repo: objects, the
+    worktree's admin dir (HEAD, index), and the folder holding the branch's ref and reflog.
+    Folders are created up front so they can be bound."""
+    out = [git_dir / "objects"]
+    try:
+        line = (worktree / ".git").read_text(encoding="utf-8").strip()
+        if line.startswith("gitdir:"):
+            out.append(Path(line.split(":", 1)[1].strip()))
+    except OSError:
+        pass
+    if branch:
+        parent = Path(*(["refs", "heads"] + branch.split("/")[:-1]))
+        for base in (git_dir / parent, git_dir / "logs" / parent):
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+                out.append(base)
+            except OSError:
+                pass
+    return out
 
 
 def _probe(network: bool) -> str:

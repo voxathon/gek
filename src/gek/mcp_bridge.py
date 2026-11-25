@@ -10,13 +10,13 @@ Tools a role wasn't granted are never shown to it.
 from __future__ import annotations
 
 import anyio
-import fnmatch
 import json
 import os
 from contextlib import AsyncExitStack
 from typing import Any
 
 from .logs import RunLog
+from .tools import Tool, granted
 
 
 class MCPBridge:
@@ -26,7 +26,7 @@ class MCPBridge:
         self.stack = AsyncExitStack()
         self.sessions: dict[str, Any] = {}
         self.tools: dict[str, tuple[str, str]] = {}  # exposed name -> (server, tool)
-        self.schemas: list[dict[str, Any]] = []
+        self.listed: list[Tool] = []
 
     async def connect(self, grants: dict[str, list[str]], servers: dict[str, Any],
                       base_env: dict[str, str] | None = None) -> None:
@@ -53,22 +53,20 @@ class MCPBridge:
                 with anyio.fail_after(spec.get("timeout_s", 60)):
                     await session.initialize()
                 listed = await session.list_tools()
-                kept, tools, schemas = [], {}, []
+                kept, tools, made = [], {}, []
                 for t in listed.tools:
-                    if any(fnmatch.fnmatch(t.name, g) for g in globs):
+                    if granted(globs, t.name):
                         name = f"mcp__{server}__{t.name}"[:64]
                         params = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None)
                         tools[name] = (server, t.name)
-                        schemas.append({"type": "function", "function": {
-                            "name": name,
-                            "description": (t.description or "")[:1000],
-                            "parameters": params or {"type": "object", "properties": {}},
-                        }})
+                        made.append(Tool(name, (t.description or "")[:1000],
+                                         params or {"type": "object", "properties": {}},
+                                         self._handler(name), source=server))
                         kept.append(t.name)
                 self.stack.push_async_callback(server_stack.aclose)
                 self.sessions[server] = session
                 self.tools.update(tools)
-                self.schemas.extend(schemas)
+                self.listed.extend(made)
                 self.log.event("mcp", self.actor, server=server, ok=True,
                                listed=[t.name for t in listed.tools], granted=kept)
             except BaseException as e:
@@ -80,6 +78,11 @@ class MCPBridge:
                     pass
                 if not isinstance(e, Exception):
                     raise  # cancellation (agent killed mid-connect) must propagate
+
+    def _handler(self, name: str):
+        async def h(**args: Any) -> str:
+            return await self.call(name, args)
+        return h
 
     async def call(self, name: str, args: dict[str, Any]) -> str:
         server, tool = self.tools[name]

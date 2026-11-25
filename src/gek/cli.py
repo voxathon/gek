@@ -386,7 +386,7 @@ async def _role_offline(cfg: Config, who: str, data: dict | None, retire: str = 
                                       f"{who}: retire role {retire}\n\nRetired: {retire}\n", ident, actor=who)
         return f"role {retire} retired"
     role = Role.from_dict(data or {})
-    errs = validate(role, cfg.raw.get("ceiling", {}), cfg.raw.get("mcp_servers", {}))
+    errs = validate(role, cfg.raw.get("ceiling", {}), cfg.tool_sources())
     if errs:
         raise UserError("role rejected:\n- " + "\n- ".join(errs))
     await repo.write_files_commit(ROLES, {f"roles/{role.name}.json": role.to_json()},
@@ -558,7 +558,7 @@ async def _role(args: argparse.Namespace) -> int:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise UserError(f"not valid JSON: {e}")
-    errs = validate(Role.from_dict(data), cfg.raw.get("ceiling", {}), cfg.raw.get("mcp_servers", {}))
+    errs = validate(Role.from_dict(data), cfg.raw.get("ceiling", {}), cfg.tool_sources())
     if errs:
         raise UserError("role rejected:\n- " + "\n- ".join(errs))
     if is_running(cfg):
@@ -579,6 +579,46 @@ async def _inbox(args: argparse.Namespace) -> int:
     sha = await repo.empty_commit(INBOX, _message(args.message, {"From": who}),
                                   Identity(who, f"{who}@outside.gek"), actor=who)
     print(f"posted to {cfg.name}'s inbox as {who}: {sha[:10]}")
+    return 0
+
+
+async def _mcp_serve(args: argparse.Namespace) -> int:
+    from .serve import ServeError, mcp_config, serve
+
+    cfg = resolve(args)
+    if args.print_config:
+        print(json.dumps(mcp_config(cfg, args.agent), indent=2))
+        return 0
+    try:
+        await serve(cfg, args.agent)
+    except ServeError as e:
+        raise UserError(str(e)) from None
+    return 0
+
+
+async def _plugins(args: argparse.Namespace) -> int:
+    from .plugin import find, installed, load_class
+
+    cfg = resolve(args)
+    conf = {k: v for k, v in (cfg.raw.get("plugins") or {}).items() if not k.startswith("_")}
+    seen = installed(cfg)
+    names = sorted(set(seen) | set(conf))
+    if not names:
+        print("no plugins installed or configured")
+        return 0
+    for name in names:
+        c = conf.get(name)
+        enabled = c is not None and not (isinstance(c, dict) and c.get("enabled") is False)
+        where = find(cfg, name)[0] or "missing"
+        status = "enabled " if enabled else ("disabled" if c is not None else "        ")
+        line = f"{status}  {name:<20} {where}"
+        if enabled:
+            try:
+                cls, info = load_class(cfg, name)
+                line += f"  {info.get('path', '')}  sha256:{info.get('sha256', '?')}"
+            except Exception as e:  # noqa: BLE001
+                line += f"  LOAD ERROR: {type(e).__name__}: {e}"
+        print(line)
     return 0
 
 
@@ -710,6 +750,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("reason", nargs="?", default="", help="why (goes on the record)")
     s.add_argument("--as", dest="sender", default="human")
     s.set_defaults(fn=_halt)
+
+    s = sub.add_parser("mcp-serve", help="serve one agent's granted tools as a stdio MCP server")
+    s.add_argument("--agent", required=True, help="agent id, ROLE/HEX (its worktree must exist)")
+    s.add_argument("--print-config", action="store_true",
+                   help="print an mcpServers snippet that launches this, and exit")
+    s.set_defaults(fn=_mcp_serve)
+
+    s = sub.add_parser("plugins", help="installed vs enabled plugins, with where they load from")
+    s.set_defaults(fn=_plugins)
 
     s = sub.add_parser("explain", help="summarize the latest run and the repo")
     s.add_argument("--run", default=None, help="run id (prefix ok)")

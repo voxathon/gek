@@ -1,10 +1,19 @@
-"""A tiny tool registry: JSON-schema function tools with logged execution."""
+"""The one tool registry. Every tool an actor sees is a Tool here, whatever provides it:
+
+  gek     the core tools (read_log, commit, merge, run, kill...), gated by role powers
+  <name>  an MCP server from mcp_servers, or a plugin that provides tools; gated by the
+          role's powers.mcp / powers.tools globs, exposed as mcp__<server>__<tool> or
+          <plugin>__<tool>
+
+One path for listing, granting, calling and logging, so a plugin's tool is granted exactly
+like an MCP tool, and `gek mcp-serve` can hand the same filtered set to an outside runtime."""
 
 from __future__ import annotations
 
 import json
 import time
 from dataclasses import dataclass
+import fnmatch
 from typing import Any, Awaitable, Callable
 
 from .logs import RunLog
@@ -31,6 +40,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     handler: Handler
+    source: str = "gek"
 
     def schema(self) -> dict[str, Any]:
         return {"type": "function", "function": {
@@ -43,14 +53,26 @@ class ToolBox:
         self.log = log
         self.max_output = max_output
         self.tools: dict[str, Tool] = {}
-        self.fallback: Callable[[str, dict[str, Any]], Awaitable[str]] | None = None
-        self.extra_schemas: list[dict[str, Any]] = []
 
-    def add(self, name: str, description: str, parameters: dict[str, Any], handler: Handler) -> None:
-        self.tools[name] = Tool(name, description, parameters, handler)
+    def add(self, name: str, description: str, parameters: dict[str, Any], handler: Handler,
+            source: str = "gek") -> None:
+        self.tools[name] = Tool(name, description, parameters, handler, source)
+
+    def add_tool(self, tool: Tool) -> None:
+        if tool.name in self.tools:
+            self.log.event("note", self.actor, error=f"tool {tool.name!r} from {tool.source} shadows one "
+                           f"from {self.tools[tool.name].source}; keeping the first")
+            return
+        self.tools[tool.name] = tool
 
     def schemas(self) -> list[dict[str, Any]]:
-        return [t.schema() for t in self.tools.values()] + self.extra_schemas
+        return [t.schema() for t in self.tools.values()]
+
+    def sources(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for t in self.tools.values():
+            out.setdefault(t.source, []).append(t.name)
+        return out
 
     async def run(self, name: str, raw_args: str) -> str:
         t0 = time.monotonic()
@@ -67,8 +89,6 @@ class ToolBox:
         try:
             if name in self.tools:
                 out = await self.tools[name].handler(**args)
-            elif self.fallback is not None:
-                out = await self.fallback(name, args)
             else:
                 out = f"ERROR: no tool named {name!r}. Available: {', '.join(self.tools)}"
             ok = not str(out).startswith("ERROR")
@@ -83,3 +103,7 @@ class ToolBox:
         self.log.event("tool_result", self.actor, name=name, ok=ok, chars=full_len,
                        ms=round((time.monotonic() - t0) * 1000), output=out[:4000])
         return out
+
+
+def granted(globs: list[str], tool: str) -> bool:
+    return any(fnmatch.fnmatch(tool, g) for g in globs)

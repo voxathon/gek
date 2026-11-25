@@ -50,6 +50,10 @@ class Swarm:
         self.repo = Repo(cfg.repo_dir, log)
         self.roles: dict[str, Role] = {}
         self.agents: dict[str, AgentHandle] = {}
+        self.live: dict[str, Any] = {}  # agent id -> Agent (transcripts, for plugins)
+        from .plugin import PluginHost
+
+        self.plugins = PluginHost(self)
         self.goal: str = cfg.raw.get("goal", "")
         self.wake = asyncio.Event()
         self.wake_reasons: list[str] = []
@@ -100,7 +104,7 @@ class Swarm:
         if key.startswith("ceiling"):
             bad = []
             for r in self.roles.values():
-                errs = validate(r, self.cfg.raw.get("ceiling", {}), self.cfg.raw.get("mcp_servers", {}))
+                errs = validate(r, self.cfg.raw.get("ceiling", {}), self.cfg.tool_sources())
                 if errs:
                     bad.append(f"{r.name} ({'; '.join(errs)})")
             if bad:
@@ -179,7 +183,7 @@ class Swarm:
 
     async def write_role(self, data: dict[str, Any], actor: str = ORCH) -> str:
         role = Role.from_dict(data)
-        errs = validate(role, self.cfg.raw.get("ceiling", {}), self.cfg.raw.get("mcp_servers", {}))
+        errs = validate(role, self.cfg.raw.get("ceiling", {}), self.cfg.tool_sources())
         if errs:
             self.log.event("role_rejected", actor, role=data, errors=errs)
             return "ERROR: role rejected:\n- " + "\n- ".join(errs)
@@ -225,6 +229,7 @@ class Swarm:
         h = AgentHandle(id=aid, role=role, branch=branch, worktree=wt, note=note)
         self.agents[aid] = h
         agent = Agent(self, h)
+        self.live[aid] = agent
         h.task = asyncio.create_task(agent.run(), name=aid)
         self.log.event("agent_spawn", actor, id=aid, role=role_name, branch=branch, base=base,
                        worktree=str(wt), note=note)
@@ -341,6 +346,7 @@ class Swarm:
         box = self._orch_tools(state)
         ceiling = {k: v for k, v in self.cfg.raw.get("ceiling", {}).items() if not k.startswith("_")}
         mcp_avail = sorted(k for k in self.cfg.raw.get("mcp_servers", {}) if not k.startswith("_"))
+        plugin_tools = self.plugins.tool_catalog()
         aliases = self.cfg.raw.get("models", {}).get("aliases", {})
         acfg = self.cfg.section("agents")
         me = self.llm.per_actor.get(ORCH, {})
@@ -357,7 +363,9 @@ class Swarm:
                 + (f"{self.resume.briefing()}\n\n" if self.resume is not None and self.wakes == 1 else "")
                 + f"Your ceiling (most you may grant): {json.dumps(ceiling)}\n"
                 f"MCP servers available: {mcp_avail or 'none'}\n"
-                f"Models: default {self.cfg.raw['models'].get('default')}; aliases for roles: "
+                + (f"Plugins with tools (grant like MCP servers, under powers.mcp): "
+                   f"{json.dumps(plugin_tools)}\n" if plugin_tools else "")
+                + f"Models: default {self.cfg.raw['models'].get('default')}; aliases for roles: "
                 f"{json.dumps({k: v for k, v in aliases.items() if not k.startswith('_')}) or 'none'} "
                 f"(aliases that map to the same model behave the same)\n"
                 f"Limits:\n"
@@ -538,6 +546,7 @@ class Swarm:
         self.log.event("sandbox", "harness", using=sb.kind, mode=sb.mode, network=sb.network,
                        reason=sb.reason, warning=sb.warning(),
                        shell_allowed=bool(self.cfg.raw.get("ceiling", {}).get("shell")))
+        await self.plugins.start()
         await self.load_roles()
         if self.resume is not None:
             self.log.event("resume", "harness", **self.resume.to_dict())
@@ -625,4 +634,8 @@ class Swarm:
                            prompt_tokens=self.llm.prompt_tokens,
                            completion_tokens=self.llm.completion_tokens,
                            cost=round(self.llm.total_cost, 6), calls=self.llm.calls)
+            try:
+                await self.plugins.stop()  # after run_end, so plugins see it
+            except Exception as e:  # noqa: BLE001
+                self.log.event("note", "harness", error=f"stopping plugins: {type(e).__name__}: {e}")
         return reason

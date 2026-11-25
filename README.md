@@ -108,6 +108,8 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 | `gek push REMOTE [BRANCH] [--to P] [--everything]` | push swarm work to a git URL or path, as `gek/<swarm>/<branch>` |
 | `gek kill AGENT [REASON]` | kill a live agent of the running swarm, on the record |
 | `gek halt [REASON]` | stop the running swarm; live agents are killed |
+| `gek plugins` | installed vs enabled plugins, where each loads from, its sha256 |
+| `gek mcp-serve --agent ROLE/HEX [--print-config]` | one agent's granted tools as a stdio MCP server (see Outside runtimes) |
 
 `--seed` takes a path or a git URL (`https://...`, `git@host:path`, `file://...`), so a VM can
 start straight from GitHub. `gek push` sends results back out without touching the remote's
@@ -301,6 +303,9 @@ Inside the sandbox:
   `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.pypirc`, `~/.npmrc`, `~/.password-store`,
   keyrings. `agents.sandbox_hide` adds paths.
 - `agents.sandbox_writable` adds writable paths; `agents.sandbox_network: false` cuts the network.
+- The swarm's git repo is read-only apart from objects, the agent's worktree metadata, and
+  the ref folder of its own role. A shell can still commit, but it can't forge commits on
+  `swarm/inbox` (Control: commands) or move `main`.
 - New PID, IPC and UTS namespaces; the command dies with the harness.
 
 Agents and the orchestrator are told in their prompts whether shells are sandboxed.
@@ -311,6 +316,79 @@ MCP servers are configured in `mcp_servers` (stdio only for now):
 "mcp_servers": { "fetch": { "command": "uvx", "args": ["mcp-server-fetch"], "env": {} } },
 "ceiling": { "mcp": { "fetch": ["*"] } }
 ```
+
+**One tool path.** Every tool an agent sees comes from a *source*: `gek` (the core tools,
+gated by powers), an MCP server, or a plugin that provides tools. `powers.mcp` (also spelled
+`powers.tools`) grants tools from MCP servers and plugins alike, by glob, within `ceiling.mcp`.
+MCP tools show up as `mcp__<server>__<tool>`, plugin tools as `<plugin>__<tool>`. Each agent's
+`tools` event records what it got from where.
+
+## Plugins
+
+Plugins are plain, unsandboxed Python that runs inside the harness: watch every event, post to
+the inbox (which wakes the orchestrator) or chatter, read transcripts, provide tools, or poke the
+live `Swarm` however you like. **Only plugins named under `plugins` in config.json load.**
+Being installed doesn't enable a plugin.
+
+```json
+"plugins": {
+  "notify": { "url": "https://ntfy.sh/my-secret-topic", "on": ["run_end", "merge", "llm_error"] },
+  "mine":   { "enabled": false }
+},
+"ceiling": { "mcp": { "notify": ["send"] } }
+```
+
+A plugin is `<name>.py`, or a folder `<name>/` with `__init__.py`, that sets `gek_plugin` to a
+`gek.plugin.Plugin` subclass. A name is looked up in this order, and the first match wins:
+
+1. `<swarm folder>/plugins/`
+2. `$GEK_HOME/plugins/`
+3. the `gek.plugins` entry point group (pip-installed)
+4. gek's bundled plugins
+
+```python
+from gek.plugin import Plugin, PluginTool
+
+class Hello(Plugin):
+    async def start(self):                 # spawn pollers here; must return
+        await self.ctx.post_inbox("hello from a plugin")
+    async def on_event(self, ev):          # every events.jsonl record
+        if ev["kind"] == "merge":
+            self.ctx.log(saw=ev["data"].get("branch"))
+    async def stop(self): ...
+    def tools(self):                       # grant with powers.mcp {"hello": ["wave"]}
+        async def wave(caller, at: str):   # caller: id, role, branch, worktree
+            return f"{caller.id} waves at {at}"
+        return [PluginTool("wave", "Wave at someone.",
+                           {"type": "object", "properties": {"at": {"type": "string"}}}, wave)]
+
+gek_plugin = Hello
+```
+
+`self.ctx` has `swarm` (the live object), `cfg`, `post_inbox`, `post_chatter`, `read_log`,
+`transcript(agent_id)` and `log(**data)`, which writes a `plugin` event.
+
+- **Crash isolation** is the one thing the harness does for you. `start`, `on_event`, `stop`
+  and tool calls run behind try/except; a plugin that raises 5 times is disabled for the run.
+- **Every load is logged** with where it came from, its path and a sha256, and `gek plugins`
+  shows the same. A plugin runs with your API key in reach, so a file you don't recognize there
+  matters. The bwrap sandbox hides plugin folders from agents.
+- **Bundled:** `notify` pushes events to ntfy or any webhook (standard library only), with a
+  per-kind cooldown. It also gives granted agents a `notify__send` tool for paging you.
+  Bundled plugins need no extras; one with a heavy dependency would get a `gek[name]` extra.
+
+## Outside runtimes
+
+`gek mcp-serve --agent ROLE/HEX` serves one agent's tools over stdio MCP, for an agent runtime
+that isn't gek's own loop. It uses tools/list and tools/call only. The client gets exactly what
+that role is granted (core tools by power, MCP and plugin tools by glob) and every call is logged
+under `logs/mcp-serve/`. `--print-config` prints an `mcpServers` snippet that launches it.
+
+- The agent's worktree must exist: spawn it first.
+- Git is the medium, so most tools work from the separate process unchanged.
+- `kill` becomes a `kill` control commit on the inbox, which a running swarm carries out.
+  `list_agents` reads the current run's events.
+- `run` is sandboxed the same way as in the harness.
 
 ## Compaction
 
@@ -365,6 +443,7 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `budget.max_total_tokens` | stop the swarm once this many tokens are spent (0 = no cap) |
 | `ceiling` | the most power the orchestrator may grant |
 | `mcp_servers` | MCP servers available to grant |
+| `plugins` | plugins to load, name -> its config (`"enabled": false` keeps one off); see Plugins |
 
 `.env` holds secrets: `~/.gek/.env` for home swarms, next to config.json for
 portable ones (a swarm folder's own `.env` and one in the current directory also load):
@@ -403,7 +482,7 @@ src/gek/
   gitrepo.py      git plumbing: swarm refs, worktrees, merges, log
   roles.py        role templates, powers, ceiling validation
   llm.py          litellm calls, token accounting, budget
-  tools.py        tool registry with logged execution
+  tools.py        the one tool registry: core, MCP and plugin tools, logged
   mcp_bridge.py   MCP servers as grantable, filtered tools
   agent.py        one agent: worktree, tools, loop, teardown
   swarm.py        roles, spawning, killing, the orchestrator wake loop
@@ -414,6 +493,9 @@ src/gek/
   web.py          `gek tui --web` with the password gate
   resume.py       `gek resume`: what a dead run left behind, salvage, cross-platform pid checks
   sandbox.py      bwrap around agents' `run` commands; the warning when there's none
+  plugin.py       plugin discovery, loading, the host (events, crash isolation, tools)
+  plugins/        bundled plugins (notify)
+  serve.py        `gek mcp-serve`: one agent's tools over stdio MCP
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
 tests/control.py  gek kill / halt / inbox against a running swarm, gek push
@@ -423,6 +505,8 @@ tests/web_login.py     the web TUI's password gate
 tests/resume.py        gek resume after a hard crash: salvage, briefing, respawn, budget
 tests/sandbox.py       what a sandboxed shell can and can't touch; fallbacks off Linux
 tests/compact.py       history compaction: notes, kept tail, opt-out, failed summaries
+tests/plugins.py       plugin loading, precedence, events, tools, crash isolation, notify
+tests/mcpserve.py      an outside MCP client driving an agent through gek mcp-serve
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -447,6 +531,8 @@ uv run python tests/web_login.py
 uv run python tests/resume.py
 uv run python tests/sandbox.py   # bwrap checks are skipped where bwrap doesn't work
 uv run python tests/compact.py
+uv run python tests/plugins.py
+uv run python tests/mcpserve.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

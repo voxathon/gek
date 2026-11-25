@@ -51,6 +51,8 @@ EVENT_KINDS = {
     "resume": "this run resumes an earlier one; data has how it ended, interrupted agents, salvaged work",
     "human_wake": "a wake in human mode: no model call; data has reasons and outside actions",
     "mcp": "an MCP server connected, failed, or listed tools",
+    "tools": "the tools an agent was given, by source (gek, an MCP server, a plugin)",
+    "plugin": "a plugin loaded, failed, was disabled, or logged something itself",
     "budget": "token totals crossed a threshold or the budget ran out",
     "note": "anything else worth knowing",
 }
@@ -226,6 +228,7 @@ class RunLog:
         self._agent_files: dict[str, Any] = {}
         self._seq = 0
         self._lock = threading.Lock()
+        self.listeners: list[Any] = []  # called with each event record (plugins)
         self.echo = {True: "feed", False: "none"}.get(echo, echo) if isinstance(echo, bool) else echo
 
     def write_meta(self, meta: dict[str, Any]) -> None:
@@ -243,6 +246,11 @@ class RunLog:
             line = f"{ts} #{self._seq:<5} {kind:<13} {actor:<22} {_short(data)}"
             self._text.write(line + "\n")
             self._text.flush()
+        for fn in list(self.listeners):
+            try:
+                fn(rec)
+            except Exception:
+                pass
         if self.echo == "all":
             print(line[11:23] + " " + f"{kind:<13} {actor:<22} {_short(data, 160)}",
                   file=sys.stderr, flush=True)

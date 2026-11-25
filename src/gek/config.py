@@ -93,6 +93,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mcp_servers": {
         "_comment": "name -> {command, args, env}. Grant them to roles via ceiling.mcp.",
     },
+    "plugins": {
+        "_comment": "name -> its config; only plugins named here load. Bundled: notify (see README).",
+    },
 }
 
 
@@ -170,6 +173,11 @@ class Config:
     @property
     def worktrees_dir(self) -> Path:
         return self.swarm_dir / "wt"
+
+    def tool_sources(self) -> set[str]:
+        """Names a role may be granted tools from: MCP servers and configured plugins."""
+        names = set(self.raw.get("mcp_servers") or {}) | set(self.raw.get("plugins") or {})
+        return {n for n in names if not n.startswith("_")}
 
     @property
     def logs_dir(self) -> Path:

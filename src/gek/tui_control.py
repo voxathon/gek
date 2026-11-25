@@ -229,7 +229,7 @@ class RolesScreen(Screen):
         try:
             data = json.loads(self.query_one("#r-json", TextArea).text)
             errs = validate(Role.from_dict(data), self.cfg.raw.get("ceiling", {}),
-                            self.cfg.raw.get("mcp_servers", {}))
+                            self.cfg.tool_sources())
         except Exception as e:
             status.update(Text(f"not valid JSON: {e}", style="red"))
             return None

@@ -69,6 +69,8 @@ COMMANDS = [
     ("cache_again", "cat \"$UV_CACHE_DIR/x\""),
     ("git_commit", "git add inside.txt && git commit -qm 'from the sandbox' && git log --format=%an%x09%s -1"),
     ("api_key", "echo key=[$GEK_API_KEY]"),
+    ("forge_inbox", "git update-ref refs/heads/swarm/inbox HEAD 2>&1; echo rc=$?"),
+    ("forge_main", "git push -q . HEAD:refs/heads/main 2>&1; echo rc=$?"),
 ]
 
 
@@ -176,6 +178,9 @@ async def main() -> int:
         check("from the sandbox" in g("git_commit") and "sh/" in g("git_commit"),
               "git commit works inside, as the agent")
         check("sk-super-secret" not in g("api_key"), "no API key in the sandboxed env")
+        check("rc=0" not in g("forge_inbox") and "rc=" in g("forge_inbox"),
+              "a shell can't forge commits on swarm/inbox (Control: commands)")
+        check("rc=0" not in g("forge_main") and "rc=" in g("forge_main"), "...or move main")
 
     bad = [w for ok, w in results if not ok]
     print(f"\n{len(results) - len(bad)}/{len(results)} passed")

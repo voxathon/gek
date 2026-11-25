@@ -8,7 +8,8 @@ Powers a role can hold (all checked against config.ceiling):
   merge      bool               may merge branches into main
   interrupt  bool               may post to swarm/inbox (wakes the orchestrator)
   kill       [role names]       may kill agents of these roles ("*" = any)
-  mcp        {server: [globs]}  MCP servers and which of their tools it sees
+  mcp        {source: [globs]}  tool sources (MCP servers, tool-providing plugins) and which
+                                of their tools it sees; `tools` is accepted as another name
 Filesystem scope is `writes`: path prefixes it may commit changes under
 ("" or "*" = anywhere in its worktree).
 """
@@ -58,7 +59,8 @@ class Role:
             merge=bool(p.get("merge", False)),
             interrupt=bool(p.get("interrupt", False)),
             kill=[str(x) for x in (p.get("kill") or [])],
-            mcp={str(k): [str(g) for g in (v or ["*"])] for k, v in (p.get("mcp") or {}).items()},
+            mcp={str(k): [str(g) for g in (v or ["*"])]
+                 for k, v in {**(p.get("tools") or {}), **(p.get("mcp") or {})}.items()},
         )
 
         def strs(v: Any) -> list[str]:
@@ -106,8 +108,15 @@ def _glob_covered(g: str, ceiling: list[str]) -> bool:
     return False
 
 
-def validate(role: Role, ceiling: dict[str, Any], mcp_servers: dict[str, Any],
+def ceiling_tools(ceiling: dict[str, Any]) -> dict[str, list[str]]:
+    """The ceiling's tool grants: `mcp` and its other name `tools`, merged."""
+    merged = {**(ceiling.get("tools") or {}), **(ceiling.get("mcp") or {})}
+    return {k: v for k, v in merged.items() if not k.startswith("_")}
+
+
+def validate(role: Role, ceiling: dict[str, Any], mcp_servers: Any,
              model_ok: bool = True) -> list[str]:
+    """mcp_servers: anything with `in` for the known tool sources (config.tool_sources())."""
     """Return a list of problems. Empty list = valid. Attenuation only: never above the ceiling."""
     errs: list[str] = []
     if not NAME_RE.match(role.name):
@@ -124,13 +133,13 @@ def validate(role: Role, ceiling: dict[str, Any], mcp_servers: dict[str, Any],
     for r in p.kill:
         if "*" not in ck and r not in ck:
             errs.append(f"kill({r}) is above the ceiling")
-    cm = {k: v for k, v in (ceiling.get("mcp") or {}).items() if not k.startswith("_")}
+    cm = ceiling_tools(ceiling)
     for server, globs in p.mcp.items():
         if server not in cm:
-            errs.append(f"mcp server {server!r} is not in the ceiling (ceiling has: {sorted(cm) or 'none'})")
+            errs.append(f"tool source {server!r} is not in the ceiling (ceiling has: {sorted(cm) or 'none'})")
             continue
         if server not in mcp_servers:
-            errs.append(f"mcp server {server!r} is not configured in mcp_servers")
+            errs.append(f"tool source {server!r} is neither in mcp_servers nor a configured plugin")
         for g in globs:
             if not _glob_covered(g, cm[server]):
                 errs.append(f"mcp {server}:{g} is above the ceiling ({cm[server]})")
