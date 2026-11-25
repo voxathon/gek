@@ -117,7 +117,7 @@ async def main() -> int:
         s0 = a.steps
         await asyncio.sleep(1.0)
         r["paused_still"] = a.steps == s0
-        r["resume"] = await G("resume", "go", "--as", "moxxie")
+        r["resume"] = await G("unpause", "go", "--as", "moxxie")
         await until(lambda: not swarm.paused)
         await asyncio.sleep(1.0)
         r["resumed_moving"] = a.steps > s0

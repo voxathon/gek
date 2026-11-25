@@ -163,7 +163,9 @@ class RunData:
 def runs_of(cfg: Config) -> list[Path]:
     if not cfg.logs_dir.exists():
         return []
-    return sorted(p for p in cfg.logs_dir.iterdir() if (p / "events.jsonl").exists())
+    from .logs import list_runs
+
+    return list_runs(cfg.logs_dir)
 
 
 def running_run(cfg: Config) -> str | None:
@@ -481,7 +483,7 @@ class GekTUI(App):
         Binding("i", "inbox", "inbox"),
         Binding("s", "spawn", "spawn"),
         Binding("k", "kill_agent", "kill"),
-        Binding("p", "pause_toggle", "pause/resume"),
+        Binding("p", "pause_toggle", "pause/unpause"),
         Binding("w", "wake", "wake", show=False),
         Binding("m", "mode_toggle", "mode"),
         Binding("o", "roles", "roles"),
@@ -501,7 +503,10 @@ class GekTUI(App):
             ("New swarm", "create a swarm (name, goal, seed) and start it", self.action_new_swarm),
             ("Run swarm", "start the selected swarm in the background", self.action_start_run),
             ("Halt swarm", "stop the selected swarm; live agents are killed", self.action_halt),
-            ("Pause / resume", "freeze or unfreeze the swarm", self.action_pause_toggle),
+            ("Pause / unpause", "freeze or unfreeze the swarm", self.action_pause_toggle),
+            ("Resume swarm", "pick up after a halt or crash: salvage work, brief the orchestrator", self.action_resume),
+            ("Resume swarm + respawn", "resume, and respawn interrupted agents onto their branches",
+             lambda: self.action_resume(respawn=True)),
             ("Spawn agent", "spawn an agent into a role", self.action_spawn),
             ("Kill agent", "kill the agent selected in the table", self.action_kill_agent),
             ("Inbox message", "message the orchestrator (wakes it)", self.action_inbox),
@@ -544,6 +549,17 @@ class GekTUI(App):
                 self._switch_to(cfg.name)
 
         self.push_screen(NewSwarmScreen(), done)
+
+    def action_resume(self, respawn: bool = False) -> None:
+        from .cli import start_detached
+
+        if self.cfg is None:
+            return
+        try:
+            pid = start_detached(self.cfg, extra=["--resume"] + (["--respawn"] if respawn else []))
+            self.notify(f"{self.cfg.name} resuming in the background (pid {pid})")
+        except Exception as e:
+            self.notify(str(e), severity="error")
 
     def action_start_run(self) -> None:
         from .cli import start_detached
@@ -613,7 +629,7 @@ class GekTUI(App):
         if self.cfg is None or not self._live():
             self.notify("this swarm isn't running", severity="warning")
             return
-        verb = "resume" if (self.cur and self.cur.paused) else "pause"
+        verb = "unpause" if (self.cur and self.cur.paused) else "pause"
         self.run_worker(self._do(verb, f"{verb}d from the TUI"))
 
     # --------------------------------------------------------- steering

@@ -46,6 +46,7 @@ EVENT_KINDS = {
     "config": "a live setting changed; data has key, old, new (or refused)",
     "mode": "who orchestrates changed: llm or human",
     "pause": "the swarm was paused or resumed",
+    "resume": "this run resumes an earlier one; data has how it ended, interrupted agents, salvaged work",
     "human_wake": "a wake in human mode: no model call; data has reasons and outside actions",
     "mcp": "an MCP server connected, failed, or listed tools",
     "budget": "token totals crossed a threshold or the budget ran out",
@@ -77,6 +78,23 @@ Quick looks:
   jq -c 'select(.kind=="agent_exit")' events.jsonl
   jq -r 'select(.kind=="llm_response") | [.t, .data.usage.total_tokens] | @tsv' events.jsonl
 """
+
+
+def list_runs(logs_dir: Path) -> list[Path]:
+    """Run directories, oldest first. Ordered by when each run actually started (the first
+    event's timestamp), not by name: two runs started in the same second would otherwise sort
+    by their random suffix."""
+    if not logs_dir.exists():
+        return []
+
+    def started(p: Path) -> tuple[float, str]:
+        try:
+            with open(p / "events.jsonl", encoding="utf-8") as f:
+                return float(json.loads(f.readline()).get("t", 0)), p.name
+        except Exception:
+            return (p / "events.jsonl").stat().st_mtime, p.name
+
+    return sorted((p for p in logs_dir.iterdir() if (p / "events.jsonl").exists()), key=started)
 
 
 def _now() -> tuple[str, float]:
@@ -146,6 +164,10 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
         if d.get("refused"):
             return f"  x  config {d.get('key')} refused: {_clip(d.get('refused'))}"
         return f"  =  {actor} set {d.get('key')}: {_clip(json.dumps(d.get('old')), 40)} -> {_clip(json.dumps(d.get('new')), 60)}"
+    if kind == "resume":
+        return (f"== resuming after {d.get('run')} ({_clip(d.get('ended'), 60)}): "
+                f"{len(d.get('interrupted') or [])} interrupted agents, {len(d.get('salvaged') or [])} salvaged, "
+                f"{d.get('tokens', 0):,} tokens carried")
     if kind == "mode":
         return f"[orchestrator] mode is now {d.get('mode')} (by {actor})"
     if kind == "pause":

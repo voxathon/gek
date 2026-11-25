@@ -39,7 +39,7 @@ def _message(message: str, trailers: dict[str, str] | None) -> str:
 
 
 class Swarm:
-    def __init__(self, cfg: Config, log: RunLog):
+    def __init__(self, cfg: Config, log: RunLog, resume: Any = None, respawn: bool = False):
         self.cfg = cfg
         self.log = log
         self.llm = LLM(cfg, log)
@@ -58,6 +58,10 @@ class Swarm:
         self.resumed.set()
         self.outside: list[str] = []  # outside actions since the orchestrator's last wake
         self._cfg_mtime = self._mtime()
+        self.resume = resume  # resume.ResumeInfo when this run picks up an earlier one
+        self.respawn = respawn
+        if resume is not None:
+            self.llm.prior_tokens = int(resume.tokens or 0)
 
     # ------------------------------------------------------- control plane
     @property
@@ -345,7 +349,8 @@ class Swarm:
                 f"Wake #{self.wakes} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}. "
                 f"Why you woke: {', '.join(reasons)}.\n\n"
                 f"Goal:\n{self.goal}\n\n"
-                f"Your ceiling (most you may grant): {json.dumps(ceiling)}\n"
+                + (f"{self.resume.briefing()}\n\n" if self.resume is not None and self.wakes == 1 else "")
+                + f"Your ceiling (most you may grant): {json.dumps(ceiling)}\n"
                 f"MCP servers available: {mcp_avail or 'none'}\n"
                 f"Models: default {self.cfg.raw['models'].get('default')}; aliases for roles: "
                 f"{json.dumps({k: v for k, v in aliases.items() if not k.startswith('_')}) or 'none'} "
@@ -357,8 +362,9 @@ class Swarm:
                 f"cut at {acfg.get('max_tool_output_chars')} chars\n"
                 f"- you: {ocfg.get('max_steps_per_wake')} steps per wake; sleep between "
                 f"{ocfg.get('min_sleep_s')}s and {ocfg.get('max_sleep_s')}s\n"
-                f"Spend: {self.llm.total_tokens:,} tokens"
-                f" of {f'{self.llm.max_tokens_budget:,}' if self.llm.max_tokens_budget else 'unlimited'} "
+                f"Spend: {self.llm.total_tokens:,} tokens this run"
+                + (f" + {self.llm.prior_tokens:,} in the runs this one resumes" if self.llm.prior_tokens else "")
+                + f" of {f'{self.llm.max_tokens_budget:,}' if self.llm.max_tokens_budget else 'unlimited'} "
                 f"(${self.llm.total_cost:.4f}); you alone: {int(me.get('tokens', 0)):,} tokens over "
                 f"{int(me.get('calls', 0))} calls. Run time {elapsed:.1f} min, wake {self.wakes}.\n"
                 + (f"Environment notes (agents see these too):\n{notes}\n" if notes else "")
@@ -484,7 +490,7 @@ class Swarm:
                     self.resumed.clear()
                     self.log.event("pause", author, paused=True, reason=reason)
                     result = "paused: the orchestrator won't wake, agents wait after their current step"
-            elif verb == "resume":
+            elif verb in ("unpause", "resume"):  # "resume" kept as an alias
                 if not self.paused:
                     result = "not paused"
                 else:
@@ -517,8 +523,21 @@ class Swarm:
                              "config_path": str(self.cfg.path), "config": self.cfg.redacted()})
         self.started = time.time()
         self.log.event("run_start", "harness", version=__version__, goal=self.goal,
-                       config=self.cfg.redacted(), platform=platform.platform(), python=sys.version)
+                       config=self.cfg.redacted(), platform=platform.platform(), python=sys.version,
+                       resume=self.resume.to_dict() if self.resume is not None else None)
         await self.load_roles()
+        if self.resume is not None:
+            self.log.event("resume", "harness", **self.resume.to_dict())
+            if self.respawn:
+                for a in self.resume.interrupted:
+                    if a.role not in self.roles:
+                        self.outside.append(f"could not respawn {a.id}: role {a.role} no longer exists")
+                        continue
+                    note = (f"You are continuing {a.id}'s work, interrupted when the last run "
+                            f"{'crashed' if a.how == 'crashed' else 'stopped'}. Its branch is yours now; "
+                            f"read its commits first. Its last state: {a.last or 'unknown'}")
+                    res = await self.spawn(a.role, note=note, resume_branch=a.branch, actor="harness")
+                    self.outside.append(f"harness (resume --respawn): {a.id} -> {res}")
         watcher = asyncio.create_task(self._inbox_watch())
         reason = "?"
         reasons = ["start"]
@@ -589,6 +608,7 @@ class Swarm:
                 await asyncio.wait(pending, timeout=30)
             self.log.event("run_end", "harness", reason=reason, wakes=self.wakes,
                            agents=len(self.agents), tokens=self.llm.total_tokens,
+                           tokens_cumulative=self.llm.total_tokens + self.llm.prior_tokens,
                            prompt_tokens=self.llm.prompt_tokens,
                            completion_tokens=self.llm.completion_tokens,
                            cost=round(self.llm.total_cost, 6), calls=self.llm.calls)

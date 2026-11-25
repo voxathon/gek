@@ -4,10 +4,10 @@
   gek init --portable [--dir D] ...         old style: config.json + .env + swarm/ in D
   gek list                                  all swarms, current one marked
   gek use NAME                              switch the current swarm
-  gek run | explain | inbox MSG | where     act on the current swarm
+  gek run | resume | explain | inbox MSG | where     act on the current swarm
   gek push REMOTE [BRANCH] [--to D]         push swarm work to a git URL or path
   gek kill AGENT [REASON] | halt [REASON]   steer a running swarm (handled within seconds)
-  gek spawn | role | config | mode | wake | pause | resume
+  gek spawn | role | config | mode | wake | pause | unpause
                                             the rest of the control plane (docs/CONTROL.md)
   gek tui [--web]                           dashboard in the terminal, or in a browser
   gek tui                                   watch every swarm: graphs, agents, live feed
@@ -101,7 +101,12 @@ async def init_home_swarm(name: str, goal: str | None, seed: str | None) -> tupl
     return cfg, notes
 
 
-def start_detached(cfg: Config, goal: str | None = None) -> int:
+def _resume_flags(args: argparse.Namespace) -> list[str]:
+    return ["--resume"] + (["--respawn"] if args.respawn else []) + (
+        ["--fresh-budget"] if args.fresh_budget else [])
+
+
+def start_detached(cfg: Config, goal: str | None = None, extra: list[str] | None = None) -> int:
     """Start `gek run` for this swarm as its own process, detached from the terminal (or the
     TUI, or the browser tab) that started it. Output goes to <swarm>/run.out. Returns the pid."""
     import subprocess
@@ -112,7 +117,7 @@ def start_detached(cfg: Config, goal: str | None = None) -> int:
         raise UserError(f"No swarm repo at {cfg.repo_dir}; run `gek init` first.")
     cmd = [sys.executable, "-m", "gek"]
     cmd += ["-c", str(cfg.path)] if cfg.portable else ["-s", cfg.name]
-    cmd += ["run", "-q"] + (["--goal", goal] if goal else [])
+    cmd += ["run", "-q"] + (["--goal", goal] if goal else []) + (extra or [])
     out = open(cfg.swarm_dir / "run.out", "a", encoding="utf-8")
     out.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
     out.flush()
@@ -200,20 +205,19 @@ def _lock_info(cfg: Config) -> str | None:
     except Exception:
         return "running? (unreadable run.lock)"
     pid = info.get("pid")
-    if os.name == "posix" and pid:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return f"stale run.lock (pid {pid} gone)"
-        except PermissionError:
-            pass
+    from .resume import pid_alive
+
+    if not pid_alive(pid):
+        return f"stale run.lock (pid {pid} gone)"
     return f"running (pid {pid}, run {info.get('run')})"
 
 
 def _last_run(cfg: Config) -> str:
     if not cfg.logs_dir.exists():
         return "never run"
-    runs = sorted(p for p in cfg.logs_dir.iterdir() if (p / "events.jsonl").exists())
+    from .logs import list_runs
+
+    runs = list_runs(cfg.logs_dir)
     if not runs:
         return "never run"
     last = runs[-1]
@@ -278,8 +282,9 @@ async def _run(args: argparse.Namespace) -> int:
     from .swarm import Swarm
 
     cfg = resolve(args)
+    resume = getattr(args, "resume", False)
     if args.detach:
-        pid = start_detached(cfg, args.goal)
+        pid = start_detached(cfg, args.goal, extra=_resume_flags(args) if resume else None)
         print(f"started {cfg.name!r} in the background (pid {pid}); output in {cfg.swarm_dir / 'run.out'}. "
               "Watch it with `gek tui`, stop it with `gek halt`.")
         return 0
@@ -291,12 +296,27 @@ async def _run(args: argparse.Namespace) -> int:
     if busy and busy.startswith("running"):
         raise UserError(f"Swarm {cfg.name!r} looks busy: {busy}. If that's wrong, delete "
                         f"{cfg.swarm_dir / 'run.lock'}.")
+    stale = bool(busy and busy.startswith("stale"))
+    if stale:
+        (cfg.swarm_dir / "run.lock").unlink(missing_ok=True)
+    resume_info = None
+    if resume:
+        from .resume import read_resume_info, salvage_worktrees
+
+        resume_info = read_resume_info(cfg)
+        resume_info.stale_lock = stale
+        resume_info.salvaged = await salvage_worktrees(cfg, Repo(cfg.repo_dir))
+        if args.fresh_budget:
+            resume_info.tokens = 0
+        print(f"resuming {cfg.name!r} after run {resume_info.run} ({resume_info.ended}); "
+              f"{len(resume_info.interrupted)} interrupted agents, {len(resume_info.salvaged)} salvaged worktrees, "
+              f"{resume_info.tokens:,} tokens carried", file=sys.stderr)
     log = RunLog(cfg.logs_dir, echo="none" if args.quiet else ("all" if args.verbose else "feed"))
     lock = cfg.swarm_dir / "run.lock"
     lock.write_text(json.dumps({"pid": os.getpid(), "run": log.run_id, "started": time.time()}),
                     encoding="utf-8")
     print(f"gek run {log.run_id} on swarm {cfg.name!r}; logs in {log.dir}", file=sys.stderr)
-    swarm = Swarm(cfg, log)
+    swarm = Swarm(cfg, log, resume=resume_info, respawn=bool(resume and args.respawn))
     try:
         reason = await swarm.run()
     finally:
@@ -595,7 +615,20 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--verbose", "-v", action="store_true", help="echo every event (the firehose) to stderr")
     s.add_argument("--detach", "-d", action="store_true",
                    help="run in the background, detached from this terminal (output to <swarm>/run.out)")
+    s.add_argument("--resume", action="store_true", help="pick up after the last run (same as gek resume)")
+    s.add_argument("--respawn", action="store_true", help="with --resume: respawn interrupted agents onto their branches")
+    s.add_argument("--fresh-budget", action="store_true", help="with --resume: don't carry tokens already spent")
     s.set_defaults(fn=_run)
+
+    s = sub.add_parser("resume", help="pick a swarm back up after a halt, Ctrl-C, budget stop or crash")
+    s.add_argument("--respawn", action="store_true",
+                   help="respawn interrupted agents onto their own branches (default: the orchestrator decides)")
+    s.add_argument("--fresh-budget", action="store_true", help="don't count tokens spent by earlier runs")
+    s.add_argument("--detach", "-d", action="store_true", help="run in the background")
+    s.add_argument("--goal", default=None, help="override the goal for this run")
+    s.add_argument("--quiet", "-q", action="store_true")
+    s.add_argument("--verbose", "-v", action="store_true")
+    s.set_defaults(fn=_run, resume=True)
 
     s = sub.add_parser("push", help="push swarm work to a git remote (URL or path)")
     s.add_argument("remote", help="git URL or path, e.g. /mnt/shared/gek or git@github.com:you/repo")
@@ -655,7 +688,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--as", dest="sender", default="human")
     s.set_defaults(fn=_wake)
 
-    for verb, helptext in (("pause", "freeze the swarm (nothing is killed)"), ("resume", "unfreeze the swarm")):
+    for verb, helptext in (("pause", "freeze the swarm (nothing is killed)"), ("unpause", "unfreeze the swarm")):
         s = sub.add_parser(verb, help=helptext)
         s.add_argument("reason", nargs="?", default="")
         s.add_argument("--as", dest="sender", default="human")

@@ -14,7 +14,9 @@ from .gitrepo import CHATTER, INBOX, MAIN, ROLES, Repo
 def _runs(logs_dir: Path) -> list[Path]:
     if not logs_dir.exists():
         return []
-    return sorted((p for p in logs_dir.iterdir() if (p / "events.jsonl").exists()), key=lambda p: p.name)
+    from .logs import list_runs
+
+    return list_runs(logs_dir)
 
 
 def _load(run: Path) -> list[dict]:

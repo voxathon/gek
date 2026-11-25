@@ -98,6 +98,7 @@ Everything else goes only to the log files. `-v` echoes every event to stderr;
 | `gek use NAME` | switch the current swarm |
 | `gek where` | paths of the current swarm's config, repo, worktrees, logs |
 | `gek run [--goal G] [-v \| -q] [--detach]` | run until the orchestrator halts, the token budget runs out, or Ctrl-C |
+| `gek resume [--respawn] [--fresh-budget] [--detach]` | pick up after the last run ended (see Resuming) |
 | `gek inbox "message" [--as NAME]` | post to the orchestrator's inbox (works while a run is going; wakes it) |
 | `gek explain [--run ID]` | human summary of a run and the repo |
 | `gek tui [--web]` | live dashboard of every swarm: graphs, agents, feed; `--web` serves it to a browser |
@@ -113,6 +114,27 @@ Pick a swarm other than the current one with `-s NAME` (or `-c path/to/config.js
 before the command: `gek -s tui explain`. `--seed` clones an existing repo; its
 default branch becomes `main`.
 
+## Resuming
+
+```
+gek resume                 # pick up after a halt, Ctrl-C, budget stop or crash
+gek resume --respawn       # ...and respawn the agents that were mid-work, onto their own branches
+gek resume --fresh-budget  # don't count tokens the earlier runs spent
+gek resume --detach        # in the background (the TUI's palette has "Resume swarm" too)
+```
+
+A resume cleans up and briefs the orchestrator before its first wake:
+
+- **A stale `run.lock`** (the process is gone; checked on Linux, macOS and Windows) is cleared.
+- **Uncommitted work** left in agent worktrees by a crash is **salvaged**: committed onto that
+  agent's branch (`gek: salvaged uncommitted work from coder-ab12`), then the worktree is removed.
+- **Agents that were mid-work** (crashed, or killed when the swarm stopped) are listed with their
+  branch, steps and last state. The orchestrator decides what to respawn (`resume_branch`), or
+  `--respawn` does it for you with a "you're continuing X's work" note.
+- **Tokens spent** by the earlier runs carry into `budget.max_total_tokens`, so a job resumed three
+  times still respects one cap.
+- The orchestrator's first briefing says how the last run ended and repeats its last note to itself.
+
 ## Control plane
 
 Everything that steers a swarm is a commit on its `swarm/inbox` branch with a `Control:` trailer,
@@ -126,7 +148,7 @@ the TUI and any other client use the same channel, so every action is on the rec
 | `gek config get [KEY]` / `gek config set KEY VALUE` | read or change settings live; VALUE is JSON. Ceiling changes ask first (`--yes` to skip). Restart-only keys are refused. |
 | `gek mode human\|llm` | who orchestrates. `human`: the model isn't called; wakes become notices in the feed and TUI. |
 | `gek wake [REASON]` | wake the orchestrator now |
-| `gek pause` / `gek resume` | freeze and unfreeze the swarm; agents finish their current step and wait |
+| `gek pause` / `gek unpause` | freeze and unfreeze the swarm; agents finish their current step and wait |
 | `gek kill AGENT [REASON]` / `gek halt [REASON]` | kill one agent / stop the swarm |
 | `gek inbox "message"` | a plain message to the orchestrator |
 
@@ -169,7 +191,7 @@ and push its work without leaving it (or a browser tab):
 | `s` | spawn an agent into a role, with a note |
 | `k` | kill the selected agent (asks for a reason) |
 | `i` | message the orchestrator (wakes it) |
-| `p` | pause / resume |
+| `p` | pause / unpause |
 | `m` | switch llm / human orchestration |
 | `w` | wake the orchestrator now |
 | `o` | roles: edit templates as JSON with live validation against the ceiling; `ctrl+s` save, `ctrl+r` retire, `ctrl+n` new |
@@ -336,12 +358,14 @@ src/gek/
   tui.py          `gek tui` (Textual + plotext)
   tui_control.py  the TUI's control screens: new swarm, spawn, push, roles, config
   web.py          `gek tui --web` with the password gate
+  resume.py       `gek resume`: what a dead run left behind, salvage, cross-platform pid checks
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
 tests/control.py  gek kill / halt / inbox against a running swarm, gek push
 tests/controlplane.py  the whole control plane through the real CLI (docs/CONTROL.md)
 tests/tui_control.py   the TUI control plane, headless: forms, editors, detached runs, phone layout
 tests/web_login.py     the web TUI's password gate
+tests/resume.py        gek resume after a hard crash: salvage, briefing, respawn, budget
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -363,6 +387,7 @@ uv run python tests/control.py
 uv run python tests/controlplane.py
 uv run python tests/tui_control.py
 uv run python tests/web_login.py
+uv run python tests/resume.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

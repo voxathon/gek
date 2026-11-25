@@ -35,10 +35,14 @@ class LLM:
     def max_tokens_budget(self) -> int:
         return int(self.cfg.section("budget").get("max_total_tokens") or 0)
 
+    prior_tokens = 0  # tokens spent by earlier runs this one resumes; they count against the cap
+
     def check_budget(self) -> None:
         cap = self.max_tokens_budget
-        if cap and self.total_tokens >= cap:
-            raise BudgetExceeded(f"token budget spent: {self.total_tokens} >= {cap}")
+        spent = self.total_tokens + self.prior_tokens
+        if cap and spent >= cap:
+            raise BudgetExceeded(f"token budget spent: {spent} >= {cap}"
+                                 + (f" (incl. {self.prior_tokens} from earlier runs)" if self.prior_tokens else ""))
 
     _resolved: dict[str, str] = {}
 

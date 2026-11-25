@@ -41,7 +41,7 @@ From: <who sent it>
 | `config set KEY` | dotted key, e.g. `agents.max_alive` | the value as JSON (`3`, `true`, `"text"`, `{...}`) | Change a live setting (see hot keys). Persisted to the swarm's `config.json`. |
 | `mode llm` / `mode human` | | reason | Who orchestrates. `human`: the model is not called on wakes; wakes become notices for you. `llm`: the model orchestrates, and you can still act. Persisted. |
 | `pause` | | reason | Freeze the swarm: the orchestrator doesn't wake, agents finish their current step and wait. Nothing is killed. |
-| `resume` | | reason | Unfreeze. |
+| `unpause` | | reason | Unfreeze. (`resume` is accepted as an alias.) |
 
 Unknown verbs and failed commands are logged (`control` event with `ok: false` and the
 error) and posted to chatter, so the sender can see why.
@@ -73,7 +73,7 @@ are authoritative: adapt to them, don't undo them.
 
 The CLI applies `role set`, `role retire`, `config set` and `mode` directly to the swarm's
 files, so they take effect on the next run. `kill`, `halt`, `wake`, `spawn`, `pause` and
-`resume` need a running swarm and say so. Commands sitting in the inbox when a run starts
+`unpause` need a running swarm and say so. Commands sitting in the inbox when a run starts
 are not replayed.
 
 ## Logging
