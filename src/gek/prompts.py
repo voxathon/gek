@@ -33,6 +33,9 @@ A role template describes a kind of worker, not a task. It usually says:
   - model (optional): a model alias for agents of this role
   - max_steps / max_tokens (optional): per-agent caps for this role. Set them: an agent
     that hits a cap is stopped, so size them to the job.
+  - compact_at (optional): prompt tokens after which an agent's older history is replaced
+    by notes it writes itself. Lower it for long grinding roles, raise it for roles that
+    need to remember every detail; -1 turns it off for the role.
 
 Delegate reading too. Don't read source files to check or understand the work yourself:
 spawn a reviewer or an investigator role and read its summary. Your context is rebuilt every

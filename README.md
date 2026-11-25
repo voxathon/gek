@@ -312,6 +312,23 @@ MCP servers are configured in `mcp_servers` (stdio only for now):
 "ceiling": { "mcp": { "fetch": ["*"] } }
 ```
 
+## Compaction
+
+Every step resends an agent's whole history, so a long agent's cost grows with the square of
+its length. Once an agent's prompt passes `agents.compact_at_tokens` (default 50,000), gek asks it
+to write notes on its own history (task, commits, current state, next steps, gotchas) and swaps
+the older messages for them. Kept: the system prompt, the spawn message and the last
+`agents.compact_keep_recent` messages (default 8, never splitting a tool call from its result).
+
+- It's on by default because short agents never reach the threshold and pay nothing. A
+  compaction costs one extra call and one prompt-cache miss.
+- A role's `compact_at` overrides the threshold; `-1` turns it off for that role. `0` in config
+  turns it off for the swarm.
+- If the summary call fails, gek falls back to trimming old tool outputs and tries again once the
+  prompt has grown by half the threshold.
+- Each compaction is a `compact` event with the notes, shows in the feed, and is in the agent's
+  transcript. Agents are told up front, so they commit and post as they go.
+
 ## Wake and sleep
 
 The orchestrator wakes on: start, its own timer (it chooses the sleep length,
@@ -339,6 +356,7 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `orchestrator.*` | sleep bounds, debounce, inbox poll, steps per wake, log size per wake |
 | `agents.max_alive`, `agents.max_steps` | swarm size cap, steps per agent (a role can set its own `max_steps`, and a `max_tokens` cap per agent) |
 | `agents.max_tool_output_chars`, `agents.shell_timeout_s` | tool output cap, shell timeout |
+| `agents.compact_at_tokens`, `agents.compact_keep_recent` | see Compaction |
 | `agents.sandbox`, `agents.sandbox_network`, `agents.sandbox_hide`, `agents.sandbox_writable` | see Sandbox |
 | `agents.env_notes` | lines every agent and the orchestrator see, e.g. `["uv is installed: use uv run", "pytest is installed"]` |
 | `agents.status_every_steps` | how often agents get a `[gek: step N/M, T tokens used]` line (every step once near a cap) |
@@ -404,6 +422,7 @@ tests/tui_control.py   the TUI control plane, headless: forms, editors, detached
 tests/web_login.py     the web TUI's password gate
 tests/resume.py        gek resume after a hard crash: salvage, briefing, respawn, budget
 tests/sandbox.py       what a sandboxed shell can and can't touch; fallbacks off Linux
+tests/compact.py       history compaction: notes, kept tail, opt-out, failed summaries
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -427,6 +446,7 @@ uv run python tests/tui_control.py
 uv run python tests/web_login.py
 uv run python tests/resume.py
 uv run python tests/sandbox.py   # bwrap checks are skipped where bwrap doesn't work
+uv run python tests/compact.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

@@ -79,6 +79,8 @@ class Agent:
         self.box = ToolBox(h.id, swarm.log, max_output=cfg.get("max_tool_output_chars", 12000))
         self.mcp = MCPBridge(h.id, swarm.log)
         self.messages: list[dict[str, Any]] = []
+        self.compactions = 0
+        self._compact_min = 0  # don't try again below this prompt size (after a failure or a big tail)
 
     # ---------------------------------------------------------------- paths
     def _path(self, rel: str) -> Path:
@@ -303,9 +305,93 @@ class Agent:
                                "use read_file if you need it again>")
             tc["function"]["arguments"] = json.dumps(args)
 
-    def _elide(self) -> None:
+    # ----------------------------------------------------------------- compaction
+    def _tail_start(self, keep: int) -> int | None:
+        """Index where the kept recent history starts: roughly the last `keep` messages, moved
+        back to an assistant message so no tool result loses the call it answers. None if
+        there's nothing old enough to compact."""
+        i = max(2, len(self.messages) - keep)
+        while i > 2 and self.messages[i].get("role") != "assistant":
+            i -= 1
+        return i if i > 3 else None
+
+    @staticmethod
+    def _render(msgs: list[dict[str, Any]], max_chars: int = 120_000) -> str:
+        parts = []
+        for m in msgs:
+            role = m.get("role")
+            if role == "assistant":
+                if m.get("content"):
+                    parts.append(f"YOU: {m['content'][:2000]}")
+                for tc in m.get("tool_calls") or []:
+                    parts.append(f"YOU CALLED {tc['function']['name']}({tc['function']['arguments'][:600]})")
+            elif role == "tool":
+                parts.append(f"RESULT: {m.get('content', '')[:1500]}")
+            else:
+                parts.append(f"{str(role).upper()}: {str(m.get('content', ''))[:3000]}")
+        text = "\n\n".join(parts)
+        return text if len(text) <= max_chars else "...(earliest part cut)...\n" + text[-max_chars:]
+
+    async def _maybe_compact(self, model: str) -> None:
+        """Past agents.compact_at_tokens of prompt, replace the older history with a summary the
+        agent writes itself. Costs one cache miss and one extra call; saves resending the whole
+        history on every later step."""
+        cfg = self.swarm.cfg.section("agents")
+        at = int(self.h.role.compact_at or cfg.get("compact_at_tokens", 0) or 0)
+        if at <= 0:
+            return
+        size = self.swarm.llm.last_prompt_tokens(self.h.id)
+        if not size:  # provider didn't say: estimate ~4 chars per token
+            size = sum(len(json.dumps(m, default=str)) for m in self.messages) // 4
+        if size < max(at, self._compact_min):
+            return
+        cut = self._tail_start(int(cfg.get("compact_keep_recent", 8)))
+        if cut is None:
+            return
+        old = self.messages[2:cut]
+        ask = [self.messages[0], {"role": "user", "content": (
+            "Your conversation is getting long, so gek is compacting it. Below is your history so far "
+            "(after your spawn message). Write the notes you'll continue from; the older history will be "
+            "replaced by them. Be concrete and complete, no padding:\n"
+            "1. What you were asked to do, in a line.\n"
+            "2. Done so far: commits (sha and what), files written or changed, decisions made.\n"
+            "3. Current state: what works, what's failing (exact errors), what's uncommitted.\n"
+            "4. Next steps, in order.\n"
+            "5. Gotchas: commands that worked, paths, things that didn't work and why.\n\n"
+            f"HISTORY:\n{self._render(old)}")}]
+        try:
+            msg = await self.swarm.llm.chat(self.h.id, model, ask, None)
+            summary = (msg.get("content") or "").strip()
+        except BudgetExceeded:
+            raise
+        except Exception as e:  # noqa: BLE001
+            self.swarm.log.event("compact", self.h.id, ok=False, error=f"{type(e).__name__}: {e}",
+                                 step=self.h.steps)
+            self._elide(force=True)
+            self._compact_min = size + at // 2  # try again once it's grown, not every step
+            return
+        if not summary:
+            self.swarm.log.event("compact", self.h.id, ok=False, error="empty summary", step=self.h.steps)
+            self._elide(force=True)
+            self._compact_min = size + at // 2
+            return
+        note = {"role": "user", "content": (
+            f"[gek: your history before step {self.h.steps} was compacted into these notes, which you "
+            f"wrote. Files and commits are as they were; use read_file / read_log to check details.]\n\n"
+            f"{summary}")}
+        self.messages = self.messages[:2] + [note] + self.messages[cut:]
+        self.compactions += 1
+        after = sum(len(json.dumps(m, default=str)) for m in self.messages) // 4
+        # a kept tail that's already near the threshold would otherwise compact every step
+        self._compact_min = after + at // 2
+        self.swarm.log.transcript(self.h.id, note)
+        self.swarm.log.event("compact", self.h.id, ok=True, step=self.h.steps, before_tokens=size,
+                             after_tokens_est=after, dropped_messages=len(old), summary=summary,
+                             n=self.compactions)
+
+    def _elide(self, force: bool = False) -> None:
         total = sum(len(json.dumps(m, default=str)) for m in self.messages)
-        if total <= CONTEXT_SOFT_LIMIT:
+        if total <= CONTEXT_SOFT_LIMIT and not force:
             return
         for m in self.messages[2:-12]:
             if m.get("role") == "tool" and len(m.get("content", "")) > 200:
@@ -329,6 +415,10 @@ class Agent:
                       + f"; shell commands time out after {cfg.get('shell_timeout_s', 180)}s"
                       + (f"; {sw.sandbox.describe()}" if h.role.powers.shell else "")
                       + f"; tool output is cut at {cfg.get('max_tool_output_chars', 12000):,} chars")
+            compact_at = int(h.role.compact_at or cfg.get("compact_at_tokens", 0) or 0)
+            if compact_at > 0:
+                limits += (f"; past ~{compact_at:,} prompt tokens your older history is replaced by notes "
+                           "you write, so commit often and keep your chatter posts informative")
             self._record({"role": "system", "content": agent_system(
                 h.role, h.id, h.branch, sw.goal, limits=limits, env_notes=env_notes_text(sw.cfg))})
             chatter = await sw.repo.log_text([CHATTER], limit=30, max_chars=8000)
@@ -351,6 +441,7 @@ class Agent:
                     h.summary = f"stopped at the role's token cap ({used:,} of {max_tokens:,})"
                     break
                 h.steps += 1
+                await self._maybe_compact(model)
                 self._elide()
                 msg = await sw.llm.chat(h.id, model, self.messages, tools)
                 self._record(msg)

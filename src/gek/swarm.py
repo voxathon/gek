@@ -262,10 +262,11 @@ class Swarm:
         async def write_role(name: str, mandate: str, reads: list[str] | None = None,
                              writes: list[str] | None = None, powers: dict[str, Any] | None = None,
                              temperament: str = "", model: str = "", max_steps: int = 0,
-                             max_tokens: int = 0) -> str:
+                             max_tokens: int = 0, compact_at: int = 0) -> str:
             return await self.write_role(dict(name=name, mandate=mandate, reads=reads, writes=writes,
                                               powers=powers or {}, temperament=temperament,
-                                              model=model, max_steps=max_steps, max_tokens=max_tokens))
+                                              model=model, max_steps=max_steps, max_tokens=max_tokens,
+                                              compact_at=compact_at))
 
         async def retire_role(name: str, reason: str = "") -> str:
             return await self.retire_role(name, reason)
@@ -311,7 +312,7 @@ class Swarm:
         box.add("list_roles", "Show current role templates.", obj(), list_roles)
         box.add("write_role", "Create or replace a role template. Validated against your ceiling.",
                 obj(["name", "mandate"], name=S, mandate=S, reads=arr(), writes=arr(),
-                    powers=powers_schema, temperament=S, model=S, max_steps=I, max_tokens=I), write_role)
+                    powers=powers_schema, temperament=S, model=S, max_steps=I, max_tokens=I, compact_at=I), write_role)
         box.add("retire_role", "Retire a role template.", obj(["name"], name=S, reason=S), retire_role)
         box.add("list_agents", "List agents spawned this run and their status.", obj(), list_agents)
         box.add("spawn", "Spawn agents into a role. resume_branch starts the new agent from an "
@@ -362,7 +363,11 @@ class Swarm:
                 f"Limits:\n"
                 f"- max {acfg.get('max_alive')} live agents\n"
                 f"- each agent: {acfg.get('max_steps')} steps unless its role sets max_steps; no token cap "
-                f"unless its role sets max_tokens; shell timeout {acfg.get('shell_timeout_s')}s; tool output "
+                f"unless its role sets max_tokens; "
+                + (f"history compacted past {int(acfg.get('compact_at_tokens') or 0):,} prompt tokens "
+                   "(a role's compact_at overrides; -1 = never)" if int(acfg.get('compact_at_tokens') or 0) > 0
+                   else "no history compaction unless its role sets compact_at")
+                + f"; shell timeout {acfg.get('shell_timeout_s')}s; tool output "
                 f"cut at {acfg.get('max_tool_output_chars')} chars; {self.sandbox.describe()}\n"
                 f"- you: {ocfg.get('max_steps_per_wake')} steps per wake; sleep between "
                 f"{ocfg.get('min_sleep_s')}s and {ocfg.get('max_sleep_s')}s\n"

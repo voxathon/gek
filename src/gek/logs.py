@@ -46,6 +46,7 @@ EVENT_KINDS = {
     "config": "a live setting changed; data has key, old, new (or refused)",
     "mode": "who orchestrates changed: llm or human",
     "pause": "the swarm was paused or resumed",
+    "compact": "an agent's older history was replaced by notes it wrote (or compaction failed)",
     "sandbox": "how agent shell commands are sandboxed this run (bwrap or none, and why)",
     "resume": "this run resumes an earlier one; data has how it ended, interrupted agents, salvaged work",
     "human_wake": "a wake in human mode: no model call; data has reasons and outside actions",
@@ -165,6 +166,11 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
         if d.get("refused"):
             return f"  x  config {d.get('key')} refused: {_clip(d.get('refused'))}"
         return f"  =  {actor} set {d.get('key')}: {_clip(json.dumps(d.get('old')), 40)} -> {_clip(json.dumps(d.get('new')), 60)}"
+    if kind == "compact":
+        if not d.get("ok"):
+            return f"  !  {actor} compaction failed: {_clip(d.get('error'), 80)}"
+        return (f"  ~  {actor} compacted its history at step {d.get('step')}: "
+                f"{d.get('before_tokens', 0):,} -> ~{d.get('after_tokens_est', 0):,} tokens")
     if kind == "sandbox":
         if d.get("using") == "bwrap":
             return f"   sandbox: bwrap (network {'on' if d.get('network') else 'off'})"

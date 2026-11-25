@@ -45,6 +45,7 @@ class Role:
     model: str = ""
     max_steps: int = 0
     max_tokens: int = 0  # per agent of this role; 0 = no cap beyond the swarm budget
+    compact_at: int = 0  # prompt tokens before history compaction; 0 = agents.compact_at_tokens, -1 = never
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2) + "\n"
@@ -77,6 +78,7 @@ class Role:
             model=str(d.get("model") or ""),
             max_steps=int(d.get("max_steps") or 0),
             max_tokens=int(d.get("max_tokens") or 0),
+            compact_at=int(d.get("compact_at") or 0),
         )
 
     def may_write(self, path: str) -> bool:

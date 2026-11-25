@@ -73,6 +73,10 @@ class LLM:
     def actor_tokens(self, actor: str) -> int:
         return int(self.per_actor.get(actor, {}).get("tokens", 0))
 
+    def last_prompt_tokens(self, actor: str) -> int:
+        """Prompt size of the actor's latest call, as the provider counted it (0 if unknown)."""
+        return int(self.per_actor.get(actor, {}).get("last_prompt", 0))
+
     def price(self, model: str, usage: dict[str, Any]) -> float | None:
         """Cost from config models.pricing, keyed by the model name as configured (or its alias),
         or by the model the server says it served. USD per million tokens:
@@ -157,6 +161,7 @@ class LLM:
         self.calls += 1
         pa = self.per_actor.setdefault(actor, {"tokens": 0, "cost": 0.0, "calls": 0})
         pa["tokens"] += usage.get("total_tokens", 0) or 0
+        pa["last_prompt"] = usage.get("prompt_tokens", 0) or 0
         pa["cost"] += cost
         pa["calls"] += 1
         self.prompt_tokens += usage.get("prompt_tokens", 0)

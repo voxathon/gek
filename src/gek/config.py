@@ -72,6 +72,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "env_passthrough": [],
         "env_notes": [],
         "status_every_steps": 5,
+        "compact_at_tokens": 50_000,
+        "compact_keep_recent": 8,
         "sandbox": "auto",
         "sandbox_network": True,
         "sandbox_hide": [],
