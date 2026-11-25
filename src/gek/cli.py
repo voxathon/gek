@@ -311,12 +311,18 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"resuming {cfg.name!r} after run {resume_info.run} ({resume_info.ended}); "
               f"{len(resume_info.interrupted)} interrupted agents, {len(resume_info.salvaged)} salvaged worktrees, "
               f"{resume_info.tokens:,} tokens carried", file=sys.stderr)
+    from .sandbox import SandboxError, detect
+
+    try:
+        sandbox = detect(cfg)
+    except SandboxError as e:
+        raise UserError(str(e)) from None
     log = RunLog(cfg.logs_dir, echo="none" if args.quiet else ("all" if args.verbose else "feed"))
     lock = cfg.swarm_dir / "run.lock"
     lock.write_text(json.dumps({"pid": os.getpid(), "run": log.run_id, "started": time.time()}),
                     encoding="utf-8")
     print(f"gek run {log.run_id} on swarm {cfg.name!r}; logs in {log.dir}", file=sys.stderr)
-    swarm = Swarm(cfg, log, resume=resume_info, respawn=bool(resume and args.respawn))
+    swarm = Swarm(cfg, log, resume=resume_info, respawn=bool(resume and args.respawn), sandbox=sandbox)
     try:
         reason = await swarm.run()
     finally:

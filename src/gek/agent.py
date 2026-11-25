@@ -225,9 +225,18 @@ class Agent:
     async def t_run(self, command: str, timeout_s: int | None = None) -> str:
         limit = min(timeout_s or 10**9, self.swarm.cfg.section("agents").get("shell_timeout_s", 180))
         env = self._shell_env()
-        proc = await asyncio.create_subprocess_shell(
-            command, cwd=str(self.h.worktree), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT, env=env)
+        sb = self.swarm.sandbox
+        if sb.active:
+            from .sandbox import hidden_roots
+
+            argv = sb.argv(command, Path(self.h.worktree).resolve(), self.swarm.cfg.repo_dir.resolve(),
+                           hidden_roots(self.swarm.cfg))
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=sb.env(env))
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                command, cwd=str(self.h.worktree), stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT, env=env)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=limit)
         except asyncio.TimeoutError:
@@ -318,6 +327,7 @@ class Agent:
             limits = (f"{max_steps} steps"
                       + (f", {max_tokens:,} tokens" if max_tokens else "")
                       + f"; shell commands time out after {cfg.get('shell_timeout_s', 180)}s"
+                      + (f"; {sw.sandbox.describe()}" if h.role.powers.shell else "")
                       + f"; tool output is cut at {cfg.get('max_tool_output_chars', 12000):,} chars")
             self._record({"role": "system", "content": agent_system(
                 h.role, h.id, h.branch, sw.goal, limits=limits, env_notes=env_notes_text(sw.cfg))})

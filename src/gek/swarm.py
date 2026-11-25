@@ -39,7 +39,11 @@ def _message(message: str, trailers: dict[str, str] | None) -> str:
 
 
 class Swarm:
-    def __init__(self, cfg: Config, log: RunLog, resume: Any = None, respawn: bool = False):
+    def __init__(self, cfg: Config, log: RunLog, resume: Any = None, respawn: bool = False,
+                 sandbox: Any = None):
+        from .sandbox import detect
+
+        self.sandbox = sandbox if sandbox is not None else detect(cfg)
         self.cfg = cfg
         self.log = log
         self.llm = LLM(cfg, log)
@@ -359,7 +363,7 @@ class Swarm:
                 f"- max {acfg.get('max_alive')} live agents\n"
                 f"- each agent: {acfg.get('max_steps')} steps unless its role sets max_steps; no token cap "
                 f"unless its role sets max_tokens; shell timeout {acfg.get('shell_timeout_s')}s; tool output "
-                f"cut at {acfg.get('max_tool_output_chars')} chars\n"
+                f"cut at {acfg.get('max_tool_output_chars')} chars; {self.sandbox.describe()}\n"
                 f"- you: {ocfg.get('max_steps_per_wake')} steps per wake; sleep between "
                 f"{ocfg.get('min_sleep_s')}s and {ocfg.get('max_sleep_s')}s\n"
                 f"Spend: {self.llm.total_tokens:,} tokens this run"
@@ -525,6 +529,10 @@ class Swarm:
         self.log.event("run_start", "harness", version=__version__, goal=self.goal,
                        config=self.cfg.redacted(), platform=platform.platform(), python=sys.version,
                        resume=self.resume.to_dict() if self.resume is not None else None)
+        sb = self.sandbox
+        self.log.event("sandbox", "harness", using=sb.kind, mode=sb.mode, network=sb.network,
+                       reason=sb.reason, warning=sb.warning(),
+                       shell_allowed=bool(self.cfg.raw.get("ceiling", {}).get("shell")))
         await self.load_roles()
         if self.resume is not None:
             self.log.event("resume", "harness", **self.resume.to_dict())

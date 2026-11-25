@@ -46,6 +46,7 @@ EVENT_KINDS = {
     "config": "a live setting changed; data has key, old, new (or refused)",
     "mode": "who orchestrates changed: llm or human",
     "pause": "the swarm was paused or resumed",
+    "sandbox": "how agent shell commands are sandboxed this run (bwrap or none, and why)",
     "resume": "this run resumes an earlier one; data has how it ended, interrupted agents, salvaged work",
     "human_wake": "a wake in human mode: no model call; data has reasons and outside actions",
     "mcp": "an MCP server connected, failed, or listed tools",
@@ -164,6 +165,12 @@ def feed_line(kind: str, actor: str, d: dict[str, Any]) -> str | None:
         if d.get("refused"):
             return f"  x  config {d.get('key')} refused: {_clip(d.get('refused'))}"
         return f"  =  {actor} set {d.get('key')}: {_clip(json.dumps(d.get('old')), 40)} -> {_clip(json.dumps(d.get('new')), 60)}"
+    if kind == "sandbox":
+        if d.get("using") == "bwrap":
+            return f"   sandbox: bwrap (network {'on' if d.get('network') else 'off'})"
+        if d.get("warning") and d.get("shell_allowed"):
+            return f"!! WARNING: {d.get('warning')}"
+        return None
     if kind == "resume":
         return (f"== resuming after {d.get('run')} ({_clip(d.get('ended'), 60)}): "
                 f"{len(d.get('interrupted') or [])} interrupted agents, {len(d.get('salvaged') or [])} salvaged, "

@@ -34,8 +34,11 @@ gek init todo --goal "what the swarm should do"   # creates ~/.gek/ on first use
 gek run
 ```
 
-Agents with the `shell` power can do anything your user can. Run swarms that
-have it inside a throwaway VM, not on a machine you care about.
+Agents with the `shell` power run commands as your user. **On Linux with bubblewrap**, each
+command is sandboxed (see Sandbox): the filesystem is read-only except the agent's worktree,
+/tmp and a cache, and the swarm's config, `.env`, logs and your `~/.ssh`-style credentials are
+hidden. **Without bubblewrap** (Windows, macOS, a minimal distro, most containers) commands run
+unsandboxed and every `gek run` prints one warning; run shell swarms in a throwaway VM there.
 
 **Host-safe mode:** set `"shell": false` in the ceiling. Agents can then only read the log,
 read and write files inside their own worktree (paths outside it are refused), commit within
@@ -267,8 +270,40 @@ being stopped. A role's `max_tokens` stops its agents at that many tokens (`toke
 Every agent also gets `read_log`, `list_files`, `read_file`, `post`, `finish`,
 and `write_file`/`commit` if it has any `writes`.
 
-Honest caveat: `shell` is a big hole. A role with a shell can do anything your
-user account can. The writes check only stops it committing outside its scope.
+Honest caveat: `shell` is a big hole without the sandbox. A role with an unsandboxed shell can
+do anything your user account can, and the writes check only stops it committing outside its
+scope. With the sandbox it can still read whatever your user can read that isn't hidden, and use
+the network (`agents.sandbox_network`).
+
+## Sandbox
+
+`agents.sandbox` decides how `run` commands are wrapped:
+
+| Value | Behavior |
+|---|---|
+| `"auto"` (default) | bwrap when it works; otherwise one warning per run and commands run as before |
+| `"bwrap"` | `gek run` refuses to start unless bwrap works |
+| `"off"` | never sandbox, no warning |
+
+`gek run` tests bwrap once at start (it can be installed but broken, e.g. inside Docker or with
+unprivileged user namespaces disabled). Install it with `apt install bubblewrap`,
+`dnf install bubblewrap`, `pacman -S bubblewrap` or `apk add bubblewrap`; desktop distros with
+Flatpak usually have it already.
+
+Inside the sandbox:
+
+- `/` is read-only; the agent's worktree and the swarm's git objects (so `git commit` works) are writable.
+- `/tmp` is a fresh tmpfs per command.
+- `$XDG_CACHE_HOME`, `UV_CACHE_DIR`, `PIP_CACHE_DIR` and `npm_config_cache` point into
+  `<swarm>/sandbox-cache`, shared by the swarm's agents and kept between commands and runs.
+- Hidden: `GEK_HOME`, the swarm folder (config.json, `.env`, logs, other agents' worktrees) and
+  `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.config/gcloud`,
+  `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, `~/.pypirc`, `~/.npmrc`, `~/.password-store`,
+  keyrings. `agents.sandbox_hide` adds paths.
+- `agents.sandbox_writable` adds writable paths; `agents.sandbox_network: false` cuts the network.
+- New PID, IPC and UTS namespaces; the command dies with the harness.
+
+Agents and the orchestrator are told in their prompts whether shells are sandboxed.
 
 MCP servers are configured in `mcp_servers` (stdio only for now):
 
@@ -304,6 +339,7 @@ agents, and the git log since the last wake. It ends the wake with `sleep` or
 | `orchestrator.*` | sleep bounds, debounce, inbox poll, steps per wake, log size per wake |
 | `agents.max_alive`, `agents.max_steps` | swarm size cap, steps per agent (a role can set its own `max_steps`, and a `max_tokens` cap per agent) |
 | `agents.max_tool_output_chars`, `agents.shell_timeout_s` | tool output cap, shell timeout |
+| `agents.sandbox`, `agents.sandbox_network`, `agents.sandbox_hide`, `agents.sandbox_writable` | see Sandbox |
 | `agents.env_notes` | lines every agent and the orchestrator see, e.g. `["uv is installed: use uv run", "pytest is installed"]` |
 | `agents.status_every_steps` | how often agents get a `[gek: step N/M, T tokens used]` line (every step once near a cap) |
 | `models.pricing` | USD per million tokens by model or alias, e.g. `{"vllm-sr/auto": {"input": 0.27, "cached_input": 0.07, "output": 1.1}}`; overrides litellm's price, which is $0 for custom providers |
@@ -359,6 +395,7 @@ src/gek/
   tui_control.py  the TUI's control screens: new swarm, spawn, push, roles, config
   web.py          `gek tui --web` with the password gate
   resume.py       `gek resume`: what a dead run left behind, salvage, cross-platform pid checks
+  sandbox.py      bwrap around agents' `run` commands; the warning when there's none
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
 tests/control.py  gek kill / halt / inbox against a running swarm, gek push
@@ -366,6 +403,7 @@ tests/controlplane.py  the whole control plane through the real CLI (docs/CONTRO
 tests/tui_control.py   the TUI control plane, headless: forms, editors, detached runs, phone layout
 tests/web_login.py     the web TUI's password gate
 tests/resume.py        gek resume after a hard crash: salvage, briefing, respawn, budget
+tests/sandbox.py       what a sandboxed shell can and can't touch; fallbacks off Linux
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -388,6 +426,7 @@ uv run python tests/controlplane.py
 uv run python tests/tui_control.py
 uv run python tests/web_login.py
 uv run python tests/resume.py
+uv run python tests/sandbox.py   # bwrap checks are skipped where bwrap doesn't work
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),
