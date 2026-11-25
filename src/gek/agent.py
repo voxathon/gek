@@ -39,6 +39,13 @@ def env_notes_text(cfg) -> str:
     return str(notes).strip()
 
 
+def mcp_grants(grants: dict[str, list[str]], cfg) -> dict[str, list[str]]:
+    """The part of a role's tool grants that names MCP servers (the rest are plugins)."""
+    servers = cfg.raw.get("mcp_servers") or {}
+    plugins = cfg.raw.get("plugins") or {}
+    return {k: v for k, v in grants.items() if k in servers or k not in plugins}
+
+
 def safe_env(cfg) -> dict[str, str]:
     """The harness env, reduced to the allowlist plus agents.env_passthrough, minus credentials.
     Used for agent shell commands and as the base env of MCP servers agents connect to."""
@@ -404,7 +411,7 @@ class Agent:
         max_steps = h.role.max_steps or cfg.get("max_steps", 60)
         how = "max_steps"
         try:
-            await self.mcp.connect(h.role.powers.mcp, sw.cfg.raw.get("mcp_servers", {}),
+            await self.mcp.connect(mcp_grants(h.role.powers.mcp, sw.cfg), sw.cfg.raw.get("mcp_servers", {}),
                                    base_env=safe_env(sw.cfg))
             self._build_tools()
             h.status = "running"

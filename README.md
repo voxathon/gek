@@ -179,12 +179,22 @@ works on a running swarm in another terminal and on old runs alike.
 
 Orchestrator wakes show as orange lines on the graphs and in a strip above
 them with each wake's reason ("timer", "inbox from moxxie", "coder/ab12 exited").
+Compactions show as cyan lines on the token graph, so you can see whether the slope
+flattens after one.
+
+The status line also shows the sandbox: green `sandbox: bwrap`, or a yellow
+`NOT SANDBOXED` when agents have shells and bwrap isn't working. It also shows how many
+plugins loaded and how many failed. The agents table has a **context** column: the agent's
+latest prompt size against its compaction threshold (`41k/50k`, yellow past 80%), with `x2`
+after it once it has compacted twice.
 
 Select an agent (or the orchestrator) in the table and press Enter for its full
 transcript: harness messages, its replies, every tool call with arguments,
 every result (errors in red), and wake separators for the orchestrator. It
-keeps updating while the agent lives. `f` toggles full/short, `s` shows the
-system prompt, `g`/`G` top/bottom, `esc` back.
+keeps updating while the agent lives. Each compaction shows as a cyan divider with the sizes
+before and after and the notes the agent wrote for itself. The header lists the agent's tools
+by source (gek core, each MCP server, each plugin). `f` toggles full/short, `s` shows the
+system prompt, `t` shows the core tool names too, `g`/`G` top/bottom, `esc` back.
 
 **The TUI is the whole control plane.** You can create a swarm, start it, steer it, stop it
 and push its work without leaving it (or a browser tab):
@@ -203,6 +213,8 @@ and push its work without leaving it (or a browser tab):
 | `c` | config: every setting; Enter on a live one changes it (applied now if running, else next run) |
 | `P` | push the swarm's work to a git remote |
 | `H` | halt (asks for a reason) |
+| `L` | plugins: every installed or configured plugin, where it loads from, this run's status (loaded, errors, disabled), its tools, sha256 and last action; `space` enables/disables, `e` edits its config |
+| `U` | resume, after reviewing first: how the last run ended, the orchestrator's last note, who was mid-work, what uncommitted work will be salvaged; choose respawn and fresh budget |
 | `ctrl+p` | command palette: every action above, plus "Swarm: NAME" to switch swarms |
 | `[` / `]`, `r`, `q` | older / newer run, rescan swarms, quit |
 
@@ -507,6 +519,7 @@ tests/sandbox.py       what a sandboxed shell can and can't touch; fallbacks off
 tests/compact.py       history compaction: notes, kept tail, opt-out, failed summaries
 tests/plugins.py       plugin loading, precedence, events, tools, crash isolation, notify
 tests/mcpserve.py      an outside MCP client driving an agent through gek mcp-serve
+tests/tui_more.py      the TUI's sandbox/plugin/compaction/tools/resume views, headless
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
 
@@ -533,6 +546,7 @@ uv run python tests/sandbox.py   # bwrap checks are skipped where bwrap doesn't 
 uv run python tests/compact.py
 uv run python tests/plugins.py
 uv run python tests/mcpserve.py
+uv run python tests/tui_more.py
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),

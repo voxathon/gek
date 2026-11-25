@@ -42,6 +42,9 @@ class AgentRow:
     cached: int = 0
     completion: int = 0
     last: str = ""
+    last_prompt: int = 0      # size of its latest prompt, what compaction looks at
+    compactions: int = 0
+    tools: dict = field(default_factory=dict)  # source -> [tool names], from its `tools` event
 
 
 @dataclass
@@ -70,6 +73,12 @@ class RunData:
     mode: str = "llm"
     paused: bool = False
     new_feed: list[str] = field(default_factory=list)
+    sandbox: dict = field(default_factory=dict)       # the `sandbox` event's data
+    compaction_list: list[tuple[float, str, int, int, int]] = field(default_factory=list)  # t, actor, step, before, after
+    compact_notes: dict = field(default_factory=dict)  # (actor, step) -> (before, after)
+    plugins: dict = field(default_factory=dict)        # name -> what this run's events say about it
+    role_compact_at: dict = field(default_factory=dict)  # role -> compact_at, from role_written
+    events: int = 0
     _partial: str = ""
 
     def poll(self) -> bool:
@@ -111,6 +120,7 @@ class RunData:
             self.t0 = t
             self.alive_series.append((t, 0))
         self.t_last = t
+        self.events += 1
         if k == "run_start":
             self.goal = d.get("goal", "")
         elif k == "run_end":
@@ -135,6 +145,7 @@ class RunData:
             a.prompt += u.get("prompt_tokens", 0) or 0
             a.completion += u.get("completion_tokens", 0) or 0
             a.cached += cch
+            a.last_prompt = u.get("prompt_tokens", 0) or a.last_prompt
         elif k == "agent_spawn":
             a = self._agent(d.get("id", "?"))
             a.role = d.get("role", a.role)
@@ -146,6 +157,37 @@ class RunData:
             a.status = d.get("how", "exited")
             self.alive = max(0, self.alive - 1)
             self.alive_series.append((t, self.alive))
+        elif k == "sandbox":
+            self.sandbox = dict(d)
+        elif k == "compact":
+            a = self._agent(actor)
+            if d.get("ok"):
+                a.compactions += 1
+                a.last_prompt = d.get("after_tokens_est", a.last_prompt)
+                self.compaction_list.append((t, actor, d.get("step", 0), d.get("before_tokens", 0),
+                                             d.get("after_tokens_est", 0)))
+                self.compact_notes[(actor, d.get("step", 0))] = (d.get("before_tokens", 0), d.get("after_tokens_est", 0))
+        elif k == "tools":
+            self._agent(actor).tools = dict(d.get("sources") or {})
+        elif k == "role_written":
+            role = d.get("role") or {}
+            if isinstance(role, dict) and role.get("name"):
+                self.role_compact_at[role["name"]] = int(role.get("compact_at") or 0)
+        elif k == "plugin" and actor.startswith("plugin:"):
+            name = actor.split(":", 1)[1]
+            p = self.plugins.setdefault(name, {"status": "?", "errors": 0, "since": self.events, "last": ""})
+            if "loaded" in d:
+                p.update(status="loaded" if d["loaded"] else "load error", since=self.events,
+                         where=d.get("where", ""), path=d.get("path", ""), sha256=d.get("sha256", ""),
+                         tools=d.get("tools") or [], error=d.get("error", ""))
+            elif d.get("disabled"):
+                p.update(status="disabled", error=d.get("reason", ""))
+            elif d.get("error"):
+                p["errors"] = d.get("errors", p["errors"] + 1)
+                p["error"] = d["error"]
+            else:
+                p["last"] = ", ".join(f"{k2}={v}" for k2, v in d.items())[:120]
+                p["last_t"] = t
         elif k == "tool_call":
             self._agent(actor).last = d.get("name", "")
         elif k == "commit" and not str(d.get("ref", "")).startswith("swarm/"):
@@ -182,6 +224,7 @@ def _mins(run: RunData, t: float) -> float:
 
 
 WAKE_COLOR = "orange"
+COMPACT_COLOR = "cyan"
 
 
 def _wake_lines(plt, run: RunData, as_minute_index: bool = False) -> None:
@@ -196,7 +239,7 @@ class TokensPlot(PlotextPlot):
         plt = self.plt
         plt.clear_data()
         plt.clear_figure()
-        plt.title("tokens (k)   | = orchestrator wake")
+        plt.title("tokens (k)   orange | wake   cyan | compaction")
         plt.xlabel("minutes")
         if run and run.token_series:
             pts = list(run.token_series)
@@ -204,6 +247,8 @@ class TokensPlot(PlotextPlot):
                 pts.append((run.view_end, pts[-1][1], pts[-1][2]))  # flat until now
             xs = [_mins(run, t) for t, _, _ in pts]
             _wake_lines(plt, run)
+            for ct, *_ in run.compaction_list:  # each compaction: does the slope flatten after it?
+                plt.vline(_mins(run, ct), COMPACT_COLOR)
             plt.plot(xs, [n / 1000 for _, n, _ in pts], label="total", marker="braille")
             if run.cached:
                 plt.plot(xs, [c / 1000 for _, _, c in pts], label="cached", marker="braille")
@@ -299,9 +344,10 @@ class TranscriptScreen(Screen):
         Binding("s", "toggle_system", "system prompt"),
         Binding("g", "top", "top"),
         Binding("G", "bottom", "bottom"),
+        Binding("t", "toggle_tools", "tools"),
     ]
     CSS = """
-    #t-head { height: 2; padding: 0 1; background: $boost; }
+    #t-head { height: auto; max-height: 12; padding: 0 1; background: $boost; }
     #t-log { height: 1fr; }
     """
 
@@ -313,6 +359,7 @@ class TranscriptScreen(Screen):
         self._msgs: list[dict[str, Any]] = []
         self._full = False
         self._show_sys = False
+        self._show_tools = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -355,6 +402,20 @@ class TranscriptScreen(Screen):
         head.append("  " + stat + "\n")
         head.append(f"{len(self._msgs)} messages | {mode} | s: system prompt "
                     f"{'shown' if self._show_sys else 'hidden'} | {self._path}", style="dim")
+        if a is not None and (a.compactions or a.last_prompt):
+            head.append(f"\ncontext {a.last_prompt:,} tokens", style="dim")
+            if a.compactions:
+                head.append(f", compacted {a.compactions}x", style="cyan")
+        if a is not None and a.tools:
+            head.append("\ntools ", style="bold")
+            parts = []
+            for src, names in sorted(a.tools.items(), key=lambda kv: kv[0] != "gek"):
+                if src == "gek" and not self._show_tools:
+                    parts.append(f"gek: {len(names)} core")
+                else:
+                    parts.append(f"{src}: {', '.join(names)}")
+            head.append(" | ".join(parts))
+            head.append("   (t: " + ("hide core names)" if self._show_tools else "show core names)"), style="dim")
         self.query_one("#t-head", Static).update(head)
 
     def _render_all(self) -> None:
@@ -385,6 +446,18 @@ class TranscriptScreen(Screen):
         if role == "system":
             log.write(Text(f"{ts} SYSTEM PROMPT", style="bold dim"))
             log.write(Text(content if self._show_sys else _clip_block(content, False, 240), style="dim"))
+        elif role == "user" and content.startswith("[gek: your history before step"):
+            import re as _re
+
+            mm = _re.search(r"before step (\d+)", content)
+            step = int(mm.group(1)) if mm else 0
+            before, after = self._run.compact_notes.get((self._actor, step), (0, 0))
+            sizes = f": {before:,} -> ~{after:,} tokens" if before else ""
+            log.write(Rule(f"compacted at step {step}{sizes}", style="cyan"))
+            notes = content.split("]", 1)[1].strip() if "]" in content else content
+            log.write(Text("notes the agent wrote for itself:", style="bold cyan"))
+            log.write(Text(_clip_block(notes, self._full, 1500), style="cyan"))
+            log.write(Rule(style="cyan"))
         elif role == "user":
             log.write(Text(f"{ts} HARNESS -> {self._actor}", style="bold cyan"))
             log.write(Text(_clip_block(content, self._full, 2500)))
@@ -412,6 +485,10 @@ class TranscriptScreen(Screen):
     def action_toggle_system(self) -> None:
         self._show_sys = not self._show_sys
         self._render_all()
+
+    def action_toggle_tools(self) -> None:
+        self._show_tools = not self._show_tools
+        self._head()
 
     def action_top(self) -> None:
         self.query_one("#t-log", RichLog).scroll_home(animate=False)
@@ -492,6 +569,8 @@ class GekTUI(App):
         Binding("R", "start_run", "run"),
         Binding("P", "push", "push", show=False),
         Binding("H", "halt", "halt"),
+        Binding("L", "plugins", "plugins"),
+        Binding("U", "resume_review", "resume"),
     ]
 
     # -------------------------------------------------- control plane
@@ -515,6 +594,8 @@ class GekTUI(App):
             ("Roles", "view and edit role templates", self.action_roles),
             ("Config", "view and change settings live", self.action_config),
             ("Push", "push swarm work to a git remote", self.action_push),
+            ("Plugins", "installed vs enabled plugins; enable, disable, edit their config", self.action_plugins),
+            ("Resume (review first)", "see what the last run left behind, then resume", self.action_resume_review),
         ]:
             yield SystemCommand(title, help_, action)
         for name in list_swarms():
@@ -560,6 +641,24 @@ class GekTUI(App):
             self.notify(f"{self.cfg.name} resuming in the background (pid {pid})")
         except Exception as e:
             self.notify(str(e), severity="error")
+
+    def action_plugins(self) -> None:
+        from .tui_control import PluginsScreen
+
+        if self.cfg is not None:
+            self.push_screen(PluginsScreen(self.cfg, self.cur))
+
+    def action_resume_review(self) -> None:
+        from .tui_control import ResumeScreen
+
+        if self.cfg is None:
+            return
+
+        def done(res) -> None:
+            if res:
+                self.notify(res)
+
+        self.push_screen(ResumeScreen(self.cfg), done)
 
     def action_start_run(self) -> None:
         from .cli import start_detached
@@ -723,7 +822,7 @@ class GekTUI(App):
 
     def on_mount(self) -> None:
         t = self.query_one("#agents", DataTable)
-        t.add_columns("agent", "status", "calls", "prompt k", "cached", "out k", "last tool")
+        t.add_columns("agent", "status", "calls", "prompt k", "cached", "out k", "context", "last tool")
         self.rescan()
         self.set_interval(TICK_S, self.tick)
 
@@ -836,6 +935,16 @@ class GekTUI(App):
             status = ("[green]RUNNING[/green]" + (" [yellow]PAUSED[/yellow]" if run.paused else "")
                       + (" [cyan]human mode[/cyan]" if run.mode == "human" else "")) if live else (
                 f"ended: {escape(reason)}" if run.ended else "[yellow]no run_end (crashed or killed)[/yellow]")
+            if not live and self.run_idx == len(self.runs) - 1:
+                status += "  [dim](U: review and resume)[/dim]"
+            sb = run.sandbox
+            if sb.get("using") == "bwrap":
+                status += f"  [green]sandbox: bwrap[/green] [dim](net {'on' if sb.get('network') else 'off'})[/dim]"
+            elif sb and sb.get("shell_allowed") and sb.get("mode") != "off":
+                status += "  [b yellow]NOT SANDBOXED[/b yellow]"
+            if run.plugins:
+                bad = sum(1 for p in run.plugins.values() if p.get("status") in ("disabled", "load error"))
+                status += f"  plugins {len(run.plugins)}" + (f" [red]({bad} failed)[/red]" if bad else "") + " [dim](L)[/dim]"
             end = time.time() if live else (run.t_last or 0)
             mins = (end - (run.t0 or end)) / 60
             total_agents = sum(1 for a in run.agents if a != "orchestrator")
@@ -877,9 +986,22 @@ class GekTUI(App):
                 status = Text(a.status, style="green" if a.status == "alive" else
                               ("red" if a.status in ("killed", "failed", "error") else ""))
                 t.add_row(a.id, status, str(a.calls), f"{a.prompt / 1000:.0f}", cached,
-                          f"{a.completion / 1000:.1f}", a.last, key=a.id)
+                          f"{a.completion / 1000:.1f}", self._context_cell(run, a), a.last, key=a.id)
             if t.row_count:
                 t.move_cursor(row=min(keep, t.row_count - 1), animate=False)
+
+    def _context_cell(self, run: RunData, a: AgentRow) -> Text:
+        """Latest prompt size against the compaction threshold, and how many compactions so far."""
+        if a.id == "orchestrator" or not a.last_prompt:
+            return Text("-", style="dim")
+        at = run.role_compact_at.get(a.role) or int(
+            (self.cfg.raw.get("agents") or {}).get("compact_at_tokens") or 0) if self.cfg else 0
+        times = f" x{a.compactions}" if a.compactions else ""
+        if at <= 0:
+            return Text(f"{a.last_prompt / 1000:.0f}k (no compaction){times}", style="dim")
+        frac = a.last_prompt / at
+        style = "bold yellow" if frac >= 0.8 and a.status == "alive" else ("cyan" if a.compactions else "")
+        return Text(f"{a.last_prompt / 1000:.0f}k/{at / 1000:.0f}k{times}", style=style)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "agents" or self.cur is None or event.row_key is None:

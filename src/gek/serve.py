@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .agent import Agent, AgentHandle, safe_env
+from .agent import Agent, AgentHandle, mcp_grants, safe_env
 from .config import Config
 from .gitrepo import INBOX, Identity
 from .logs import RunLog
@@ -109,7 +109,8 @@ async def build(cfg: Config, agent_id: str) -> tuple[Any, RemoteAgent]:
     agent = RemoteAgent(swarm, h)
     swarm.plugins = PluginHost(swarm, serve_only=True)
     await swarm.plugins.start()
-    await agent.mcp.connect(role.powers.mcp, cfg.raw.get("mcp_servers", {}), base_env=safe_env(cfg))
+    await agent.mcp.connect(mcp_grants(role.powers.mcp, cfg), cfg.raw.get("mcp_servers", {}),
+                            base_env=safe_env(cfg))
     agent._build_tools()
     log.event("note", agent_id, serving=sorted(agent.box.tools), pid=__import__("os").getpid())
     return swarm, agent

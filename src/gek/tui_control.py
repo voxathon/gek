@@ -358,3 +358,254 @@ class ConfigScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         event.stop()
         self.action_edit()
+
+
+# ------------------------------------------------------------------- plugins
+class PluginEditScreen(_Form):
+    """Edit one plugin's config block as JSON."""
+
+    def __init__(self, name: str, conf: dict):
+        super().__init__()
+        self.name_ = name
+        self.conf = conf
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="form"):
+            yield Label(Text(f"plugins.{self.name_} (JSON object; \"enabled\": false keeps it off)", style="bold"))
+            yield TextArea(json.dumps(self.conf, indent=2), id="p-json", language="json")
+            yield Label("", id="err", classes="err")
+            with Horizontal(id="buttons"):
+                yield Button("Save", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    async def submit(self) -> None:
+        data = json.loads(self.query_one("#p-json", TextArea).text)
+        if not isinstance(data, dict):
+            raise ValueError("a plugin's config must be a JSON object")
+        self.dismiss(data)
+
+
+class PluginsScreen(Screen):
+    """Every plugin gek can see or is told to load: where from, enabled or not, what it did this run."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "back"),
+        Binding("space", "toggle", "enable/disable"),
+        Binding("e", "edit", "edit config"),
+    ]
+    CSS = """
+    #pl-note { height: auto; padding: 0 1; }
+    #pl-detail { height: auto; max-height: 8; padding: 0 1; background: $boost; }
+    """
+
+    def __init__(self, cfg: Config, run=None):
+        super().__init__()
+        self.cfg = cfg
+        self.run = run  # RunData of the run being viewed, for this-run status
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="pl-note")
+        yield DataTable(id="pl-table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="pl-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#pl-table", DataTable).add_columns(
+            "plugin", "config", "from", "this run", "tools", "sha256", "last action")
+        self.refresh_table()
+
+    def _conf(self) -> dict:
+        return {k: v for k, v in (self.cfg.raw.get("plugins") or {}).items() if not k.startswith("_")}
+
+    def refresh_table(self) -> None:
+        from .cli import is_running
+        from .plugin import find, installed
+
+        self.cfg = _reload(self.cfg)
+        conf = self._conf()
+        seen = installed(self.cfg)
+        live = (self.run.plugins if self.run is not None else {}) or {}
+        t = self.query_one("#pl-table", DataTable)
+        keep = t.cursor_row
+        t.clear()
+        for name in sorted(set(seen) | set(conf) | set(live)):
+            c = conf.get(name)
+            if c is None:
+                cstate = Text("not configured", style="dim")
+            elif isinstance(c, dict) and c.get("enabled") is False:
+                cstate = Text("disabled", style="yellow")
+            else:
+                cstate = Text("enabled", style="green")
+            where = find(self.cfg, name)[0] or "missing"
+            p = live.get(name) or {}
+            st = p.get("status", "")
+            if st == "loaded" and p.get("errors"):
+                st = f"loaded, {p['errors']} errors"
+            run_state = Text(st or "-", style={"loaded": "green", "disabled": "red", "load error": "red"}.get(
+                p.get("status", ""), "yellow" if p.get("errors") else "dim"))
+            tools = ", ".join(p.get("tools") or []) or "-"
+            last = p.get("last", "") or "-"
+            t.add_row(name, cstate, Text(where, style="red" if where == "missing" else ""), run_state,
+                      tools, p.get("sha256", "") or "-", last[:60], key=name)
+        if t.row_count:
+            t.move_cursor(row=min(keep, t.row_count - 1))
+        run_name = self.run.path.parent.name if self.run is not None else "no run"
+        self.query_one("#pl-note", Static).update(Text.assemble(
+            (f"{self.cfg.name} plugins", "bold"),
+            f"  |  'this run' is {run_name}  |  space: enable/disable, e: edit config  |  ",
+            ("changes apply on the next run" if is_running(self.cfg) else "changes are saved to config.json",
+             "yellow" if is_running(self.cfg) else "dim")))
+        self._detail()
+
+    def _selected(self) -> str | None:
+        t = self.query_one("#pl-table", DataTable)
+        if not t.row_count:
+            return None
+        return str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+
+    def _detail(self) -> None:
+        from .plugin import find
+
+        name = self._selected()
+        box = self.query_one("#pl-detail", Static)
+        if not name:
+            box.update(Text("no plugins installed or configured. Bundled ones show here; "
+                            "drop your own .py into the swarm's plugins/ folder or $GEK_HOME/plugins/.", style="dim"))
+            return
+        p = ((self.run.plugins if self.run is not None else {}) or {}).get(name, {})
+        where, path, ep = find(self.cfg, name)
+        out = Text()
+        out.append(name, style="bold")
+        out.append(f"  {p.get('path') or path or (ep.value if ep else 'not found')}\n", style="dim")
+        out.append("config: " + json.dumps(self._conf().get(name)) + "\n")
+        if p.get("error"):
+            out.append("error: " + str(p["error"]) + "\n", style="red")
+        if p.get("last"):
+            out.append("last: " + p["last"], style="dim")
+        box.update(out)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._detail()
+
+    def _save(self, name: str, conf: dict) -> None:
+        from .config import persist_key
+
+        persist_key(self.cfg.path, f"plugins.{name}", conf)
+        self.refresh_table()
+
+    def action_toggle(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+        c = self._conf().get(name)
+        if c is None:
+            c, verb = {}, "enabled"
+        elif isinstance(c, dict) and c.get("enabled") is False:
+            c = {k: v for k, v in c.items() if k != "enabled"}
+            verb = "enabled"
+        else:
+            c, verb = {**(c if isinstance(c, dict) else {}), "enabled": False}, "disabled"
+        self._save(name, c)
+        hint = ""
+        if verb == "enabled" and name == "notify" and not c.get("url"):
+            hint = '; it needs a "url": press e'
+        self.notify(f"{name} {verb}{hint}")
+
+    def action_edit(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+        conf = self._conf().get(name)
+        conf = conf if isinstance(conf, dict) else {}
+
+        def done(res) -> None:
+            if res is not None:
+                self._save(name, res)
+                self.notify(f"plugins.{name} saved")
+
+        self.app.push_screen(PluginEditScreen(name, conf), done)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        event.stop()
+        self.action_edit()
+
+
+# ------------------------------------------------------------------- resume
+class ResumeScreen(_Form):
+    """What the last run left behind, before resuming it."""
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+
+    def _summary(self) -> tuple[Text, bool]:
+        import subprocess
+
+        from .cli import is_running
+        from .resume import read_resume_info
+
+        if is_running(self.cfg):
+            return Text(f"{self.cfg.name} is running; there's nothing to resume.", style="yellow"), False
+        info = read_resume_info(self.cfg)
+        if info.run is None:
+            return Text("no runs yet: use R (run) instead.", style="yellow"), False
+        out = Text()
+        out.append(f"last run {info.run}: ", style="bold")
+        out.append("CRASHED (no clean shutdown)\n" if info.crashed else f"ended: {info.ended}\n",
+                   style="red" if info.crashed else "")
+        if info.last_note:
+            out.append(f"orchestrator's last note: {info.last_note[:300]}\n", style="dim")
+        out.append(f"tokens so far: {info.tokens:,} (carried into the budget unless you tick fresh budget)\n")
+        if info.interrupted:
+            n = len(info.interrupted)
+            out.append(f"\n{n} agent{'s' if n != 1 else ''} {'were' if n != 1 else 'was'} mid-work:\n", style="bold")
+            for a in info.interrupted[:12]:
+                out.append(f"  {a.id:<22} {a.how:<8} {a.steps} steps on {a.branch}\n")
+                if a.last:
+                    out.append(f"      last: {a.last[:110]}\n", style="dim")
+        else:
+            out.append("\nno agents were mid-work\n", style="dim")
+        dirty = []
+        wt_root = self.cfg.worktrees_dir
+        if wt_root.exists():
+            for wt in sorted(p for p in wt_root.iterdir() if p.is_dir()):
+                try:
+                    r = subprocess.run(["git", "status", "--porcelain"], cwd=wt, capture_output=True,
+                                       text=True, timeout=15)
+                    n = len([ln for ln in r.stdout.splitlines() if ln.strip()])
+                except Exception:  # noqa: BLE001
+                    n = -1
+                if n:
+                    dirty.append((wt.name, n))
+        if dirty:
+            out.append("\nuncommitted work to salvage onto its branch:\n", style="bold")
+            for name, n in dirty:
+                out.append(f"  {name}: {'?' if n < 0 else n} files\n")
+        return out, True
+
+    def compose(self) -> ComposeResult:
+        text, ok = self._summary()
+        self.ok = ok
+        with Vertical(id="form"):
+            yield Label(Text(f"Resume {self.cfg.name}", style="bold"))
+            yield Static(text, id="r-summary")
+            yield Checkbox("respawn the interrupted agents onto their branches", value=True, id="r-respawn",
+                           disabled=not ok)
+            yield Checkbox("fresh budget (don't count earlier runs' tokens)", value=False, id="r-fresh",
+                           disabled=not ok)
+            yield Label("", id="err", classes="err")
+            with Horizontal(id="buttons"):
+                yield Button("Resume", id="ok", variant="primary", disabled=not ok)
+                yield Button("Cancel", id="cancel")
+
+    async def submit(self) -> None:
+        from .cli import start_detached
+
+        extra = ["--resume"]
+        if self.query_one("#r-respawn", Checkbox).value:
+            extra.append("--respawn")
+        if self.query_one("#r-fresh", Checkbox).value:
+            extra.append("--fresh-budget")
+        pid = start_detached(self.cfg, extra=extra)
+        self.dismiss(f"{self.cfg.name} resuming in the background (pid {pid}; {' '.join(extra[1:]) or 'no respawn'})")
