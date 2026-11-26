@@ -30,8 +30,9 @@ import time
 from pathlib import Path
 
 from .config import (DEFAULT_CONFIG, ENV_TEMPLATE, NAME_OK, Config, current_swarm, gek_home,
-                     is_gek_config, list_swarms, load_config, load_swarm, set_current_swarm,
-                     swarms_dir, write_default_config, write_home_defaults, write_swarm_config)
+                     is_gek_config, list_swarms, load_config, load_swarm, mcp_servers as
+                     mcp_servers_enabled, set_current_swarm, swarms_dir, write_default_config,
+                     write_home_defaults, write_swarm_config)
 from .gitrepo import INBOX, GitError, Identity, Repo
 
 
@@ -431,7 +432,38 @@ async def do_control(cfg: Config, who: str, control: str, reason: str = "", payl
     if verb == "mode":
         persist_key(cfg.path, "orchestrator.mode", arg)
         return f"mode {arg} saved (applies on the next run)"
+    if verb == "mcp":
+        return _mcp_offline(cfg, arg, payload)
     raise UserError(f"{cfg.name!r} isn't running; {verb} needs a running swarm")
+
+
+def _mcp_offline(cfg: Config, arg: str, payload: str) -> str:
+    """`mcp set|rm|enable|disable <name>` with no swarm running: write config.json, which the next
+    run loads (and a running swarm would pick up through its file watcher)."""
+    from .config import mcp_edit, persist_key
+
+    action, _, name = arg.strip().partition(" ")
+    action, name = action.strip(), name.strip()
+    entry = None
+    if action == "set":
+        text = payload[payload.find("{"): payload.rfind("}") + 1]
+        if not text:
+            raise UserError(f"mcp set {name} needs the server entry as JSON")
+        try:
+            entry = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise UserError(f"mcp set {name}: the entry isn't valid JSON: {e}")
+    try:
+        servers = mcp_edit(cfg.raw.get("mcp_servers"), action, name, entry)
+    except ValueError as e:
+        raise UserError(str(e))
+    persist_key(cfg.path, "mcp_servers", servers)
+    return f"mcp {action} {name}: {_mcp_offline_note(servers)} saved (not running; applies on the next run)"
+
+
+def _mcp_offline_note(servers: dict) -> str:
+    on = len(mcp_servers_enabled(servers))
+    return f"{on} server{'s' if on != 1 else ''} enabled;"
 
 
 def _sent(cfg: Config, what: str, sha: str) -> None:

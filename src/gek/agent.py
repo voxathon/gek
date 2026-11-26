@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import mcp_servers
 from .gitrepo import CHATTER, INBOX, MAIN, Identity
 from .llm import BudgetExceeded
 from .mcp_bridge import MCPBridge
@@ -85,6 +86,7 @@ class Agent:
         cfg = swarm.cfg.section("agents")
         self.box = ToolBox(h.id, swarm.log, max_output=cfg.get("max_tool_output_chars", 12000))
         self.mcp = MCPBridge(h.id, swarm.log)
+        self.mcp_gen = -1  # swarm.mcp_generation this bridge was built at (see _reconnect_mcp)
         self.messages: list[dict[str, Any]] = []
         self.compactions = 0
         self._compact_min = 0  # don't try again below this prompt size (after a failure or a big tail)
@@ -404,6 +406,48 @@ class Agent:
             if m.get("role") == "tool" and len(m.get("content", "")) > 200:
                 m["content"] = m["content"][:200] + "...(elided to save context; re-run the tool if needed)"
 
+    # ------------------------------------------------------------- mcp (live)
+    async def _connect_mcp(self) -> None:
+        """Connect the bridge for the servers this role may use (enabled ones only)."""
+        sw, h = self.swarm, self.h
+        await self.mcp.connect(mcp_grants(h.role.powers.mcp, sw.cfg),
+                               mcp_servers(sw.cfg.raw.get("mcp_servers"), only_enabled=True),
+                               base_env=safe_env(sw.cfg))
+        self.mcp_gen = sw.mcp_generation
+
+    async def _reconnect_mcp(self, _tools: list) -> list:
+        """mcp_servers changed while we run: drop the old bridge, open a new one, rebuild the
+        tool list -- no restart, no orchestrator involvement. A bad entry must not kill the
+        agent: keep running with whatever connected (or with no MCP tools) and say so."""
+        sw, h = self.swarm, self.h
+        gen = sw.mcp_generation
+        stale = [t["function"]["name"] for t in self.box.schemas()
+                 if str(t.get("function", {}).get("name", "")).startswith("mcp__")]
+        try:
+            await self.mcp.close()
+        except BaseException:
+            pass
+        self.mcp = MCPBridge(h.id, sw.log)
+        err = None
+        try:
+            await self._connect_mcp()
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            sw.log.event("note", h.id, error=f"mcp reconnect failed: {err}")
+        for name in stale:  # stale MCP tools out, then the fresh ones in
+            self.box.tools.pop(name, None)
+        try:
+            self._build_tools()
+        except Exception as e:
+            err = err or f"{type(e).__name__}: {e}"
+        now = sorted(t["function"]["name"] for t in self.box.schemas()
+                     if str(t.get("function", {}).get("name", "")).startswith("mcp__"))
+        self._record({"role": "user", "content": (
+            f"[gek: mcp_servers changed live (generation {gen}); your MCP bridge was reconnected "
+            f"between steps. Tools now available from MCP servers: "
+            f"{', '.join(now) if now else 'none'}." + (f" Reconnect problem: {err}" if err else ""))})
+        return self.box.schemas()
+
     async def run(self) -> None:
         sw = self.swarm
         h = self.h
@@ -411,8 +455,7 @@ class Agent:
         max_steps = h.role.max_steps or cfg.get("max_steps", 60)
         how = "max_steps"
         try:
-            await self.mcp.connect(mcp_grants(h.role.powers.mcp, sw.cfg), sw.cfg.raw.get("mcp_servers", {}),
-                                   base_env=safe_env(sw.cfg))
+            await self._connect_mcp()
             self._build_tools()
             h.status = "running"
             model = sw.cfg.model(h.role.model or None)
@@ -435,6 +478,11 @@ class Agent:
                 f"Recent chatter:\n{chatter}\n\nRecent main:\n{mainlog}\n\nBegin.")})
             tools = self.box.schemas()
             while True:
+                # live MCP config: the swarm bumps mcp_generation when mcp_servers change.
+                # Reconnect here, in this agent's own task, between steps (never from the
+                # orchestrator loop: the bridge's anyio cancel scopes must open+close in one task).
+                if sw.mcp_generation != self.mcp_gen:
+                    tools = await self._reconnect_mcp(tools)
                 # caps are re-read every step, so live config changes apply to running agents
                 cfg = sw.cfg.section("agents")
                 every = max(1, int(cfg.get("status_every_steps", 5)))
