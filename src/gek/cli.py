@@ -439,7 +439,11 @@ async def do_control(cfg: Config, who: str, control: str, reason: str = "", payl
 
 def _mcp_offline(cfg: Config, arg: str, payload: str) -> str:
     """`mcp set|rm|enable|disable <name>` with no swarm running: write config.json, which the next
-    run loads (and a running swarm would pick up through its file watcher)."""
+    run loads (and a running swarm would pick up through its file watcher).
+
+    `set` takes the same JSON the live control plane takes: a remote {"url", "transport",
+    "headers"} entry ("${ENV:NAME}" placeholders; never a literal secret) or a stdio {"command",
+    "args"} one. config.mcp_edit validates it, so both paths accept exactly the same thing."""
     from .config import mcp_edit, persist_key, set_path
 
     action, _, name = arg.strip().partition(" ")
@@ -459,7 +463,24 @@ def _mcp_offline(cfg: Config, arg: str, payload: str) -> str:
         raise UserError(str(e))
     persist_key(cfg.path, "mcp_servers", servers)
     set_path(cfg.raw, "mcp_servers", servers)  # so a second call in the same TUI session sees it
-    return f"mcp {action} {name}: {_mcp_offline_note(servers)} saved (not running; applies on the next run)"
+    note = _mcp_set_note(entry) if action == "set" else ""
+    line = f"mcp {action} {name}".strip() + (f": {note}" if note else "")
+    return f"{line}: {_mcp_offline_note(servers)} saved (not running; applies on the next run)"
+
+
+def _mcp_set_note(spec: dict | None) -> str:
+    """What was saved, in a line a human can check: for a remote server its endpoint host (+path)
+    and transport -- never a header or env VALUE (those live in .env and are resolved at connect
+    time). A stdio server adds nothing: its line is what it always was."""
+    from .config import mcp_endpoint, mcp_kind, mcp_transport
+
+    if not isinstance(spec, dict) or mcp_kind(spec) != "remote":
+        return ""
+    endpoint = str(mcp_endpoint(spec)).split("://", 1)[-1]  # drop the scheme, never userinfo
+    if "@" in endpoint.split("/", 1)[0]:
+        endpoint = endpoint.split("@", 1)[-1]  # a url may carry credentials; those are secrets
+    endpoint = endpoint.split("?", 1)[0].rstrip("/") or "?"
+    return f"{endpoint} ({mcp_transport(spec)})"
 
 
 def _mcp_offline_note(servers: dict) -> str:
