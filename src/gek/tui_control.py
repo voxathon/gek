@@ -46,8 +46,15 @@ class _Form(ModalScreen):
         self.dismiss(None)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
+        # The one handler for the whole form. textual calls *every* on_button_pressed in the
+        # class MRO, so a form that also defined its own would run the press twice: on Save that
+        # meant two dismisses and two `mcp set` commits per click. Forms customise submit() (and
+        # what "del" dismisses with) instead of the handler.
+        event.stop()  # the press is ours: don't let parent screens act on it too
         if event.button.id == "cancel":
             self.dismiss(None)
+        elif event.button.id == "del":
+            self.dismiss("delete")
         elif event.button.id == "ok":
             try:
                 await self.submit()
@@ -608,12 +615,6 @@ class McpEditScreen(_Form):
     def on_mount(self) -> None:
         self.query_one("#cmd", Input).focus()
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "del":
-            self.dismiss("delete")
-        else:
-            await super().on_button_pressed(event)
-
     async def submit(self) -> None:
         import shlex
 
@@ -822,11 +823,14 @@ class McpScreen(Screen):
 
     def _edit(self, name: str, spec: dict) -> None:
         def done(res) -> None:
+            # The control commit outlives this screen: a worker owned by McpScreen is cancelled
+            # when the screen unmounts (textual Widget._on_unmount -> workers.cancel_node), i.e.
+            # as soon as the user leaves the MCP screen, so run it on the App.
             if isinstance(res, dict):
-                self.run_worker(self._control(f"mcp set {name}", f"set {name} from the TUI",
-                                              json.dumps(res)))
+                self.app.run_worker(self._control(f"mcp set {name}", f"set {name} from the TUI",
+                                                  json.dumps(res)))
             elif res == "delete":
-                self.run_worker(self._control(f"mcp rm {name}", "removed from the TUI"))
+                self.app.run_worker(self._control(f"mcp rm {name}", "removed from the TUI"))
 
         self.app.push_screen(McpEditScreen(name, spec), done)
 
