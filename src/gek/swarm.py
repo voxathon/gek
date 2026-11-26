@@ -32,7 +32,7 @@ def mcp_entry_summary(servers: Any) -> dict[str, Any]:
     for name, spec in mcp_servers(servers, only_enabled=False).items():
         e = mcp_entry(spec)
         out[name] = {"enabled": e["enabled"], "command": os.path.basename(e.get("command", "")),
-                     "n_tools_env": len(e.get("env") or {})}
+                     "env_vars": sorted((e.get("env") or {}))}  # names only, never values
     return out
 
 

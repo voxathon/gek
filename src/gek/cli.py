@@ -440,7 +440,7 @@ async def do_control(cfg: Config, who: str, control: str, reason: str = "", payl
 def _mcp_offline(cfg: Config, arg: str, payload: str) -> str:
     """`mcp set|rm|enable|disable <name>` with no swarm running: write config.json, which the next
     run loads (and a running swarm would pick up through its file watcher)."""
-    from .config import mcp_edit, persist_key
+    from .config import mcp_edit, persist_key, set_path
 
     action, _, name = arg.strip().partition(" ")
     action, name = action.strip(), name.strip()
@@ -458,6 +458,7 @@ def _mcp_offline(cfg: Config, arg: str, payload: str) -> str:
     except ValueError as e:
         raise UserError(str(e))
     persist_key(cfg.path, "mcp_servers", servers)
+    set_path(cfg.raw, "mcp_servers", servers)  # so a second call in the same TUI session sees it
     return f"mcp {action} {name}: {_mcp_offline_note(servers)} saved (not running; applies on the next run)"
 
 
