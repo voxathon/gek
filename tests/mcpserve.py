@@ -336,7 +336,7 @@ class RemoteMCPServer:
         if self.kind != "streamable-http":
             spec["transport"] = self.kind
         if self.token:
-            spec["headers"] = {"Authorization": "${ENV:MCP_TOKEN}"}
+            spec["headers"] = {"Authorization": "Bearer ${ENV:MCP_TOKEN}"}
         return spec
 
     @classmethod

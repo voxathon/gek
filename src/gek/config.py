@@ -238,6 +238,10 @@ MCP_FIELDS = tuple(sorted(set(MCP_STDIO_FIELDS) | set(MCP_REMOTE_FIELDS)))
 MCP_TRANSPORTS = ("streamable-http", "sse")
 MCP_DEFAULT_TIMEOUT_S = 60
 MCP_PLACEHOLDER = re.compile(r"^\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}$")
+# The same placeholder ANYWHERE inside a value, so the documented header form
+# {"Authorization": "Bearer ${ENV:MCP_TOKEN}"} expands with its scheme kept. A value may hold
+# several placeholders; a whole-value placeholder behaves as it always has (bare value).
+MCP_PLACEHOLDER_REF = re.compile(r"\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}")
 MCP_ACTIONS = ("set", "rm", "enable", "disable")
 MCP_KINDS = ("stdio", "remote")
 
@@ -459,9 +463,9 @@ def mcp_header_env_names(spec: Any) -> list[str]:
     spec = spec if isinstance(spec, dict) else {}
     names: list[str] = []
     for value in (spec.get("headers") or {}).values():
-        m = MCP_PLACEHOLDER.match(str(value))
-        if m and m.group(1) not in names:
-            names.append(m.group(1))
+        for var in MCP_PLACEHOLDER_REF.findall(str(value)):
+            if var not in names:
+                names.append(var)
     return sorted(names)
 
 
@@ -469,11 +473,14 @@ def mcp_resolve_headers(spec: Any, environ: Any = None,
                         name: str = "") -> dict[str, str]:
     """The concrete headers for a remote entry, at connect time. Values never reach logs.
 
-    Header values may be "${ENV:NAME}" placeholders and are expanded from `environ` (default
-    os.environ -- the harness env, where .env has already been loaded). A placeholder whose
-    variable is missing or empty raises ValueError naming the server and the variable but never a
-    value. Literal (non-placeholder) values are passed through, so a header that isn't a secret
-    keeps working. Remote entries only: a stdio entry has no headers."""
+    Header values may contain "${ENV:NAME}" placeholders and are expanded from `environ` (default
+    os.environ -- the harness env, where .env has already been loaded). Every placeholder inside a
+    value is substituted, so the documented {"Authorization": "Bearer ${ENV:MCP_TOKEN}"} keeps its
+    scheme and a value may hold several placeholders; a value that is exactly one placeholder
+    yields that variable's value alone, as before. A placeholder whose variable is missing or
+    empty raises ValueError naming the server, the header key and the variable but never a value.
+    Values with no placeholder are passed through unchanged, so a header that isn't a secret keeps
+    working. Remote entries only: a stdio entry has no headers."""
     label = _mcp_label(name)
     spec = spec if isinstance(spec, dict) else {}
     if mcp_kind(spec) != "remote":
@@ -481,18 +488,21 @@ def mcp_resolve_headers(spec: Any, environ: Any = None,
     env = os.environ if environ is None else environ
     out: dict[str, str] = {}
     for key, raw in (spec.get("headers") or {}).items():
-        text = str(raw)
-        m = MCP_PLACEHOLDER.match(text)
-        if not m:
-            out[str(key)] = text
-            continue
+        out[str(key)] = _mcp_expand_env(str(raw), env, str(key), label)
+    return out
+
+
+def _mcp_expand_env(text: str, env: Any, key: str, label: str) -> str:
+    """One header value with every ${ENV:NAME} substituted. Never puts a value in an error."""
+    def replace(m: re.Match[str]) -> str:
         var = m.group(1)
         value = env.get(var) if hasattr(env, "get") else None
         if not value:
             raise ValueError(f"{label}: header {key!r} needs ${var} from the environment "
                              f"(put {var}=... in .env); it is missing or empty")
-        out[str(key)] = str(value)
-    return out
+        return str(value)
+
+    return MCP_PLACEHOLDER_REF.sub(replace, text)
 
 
 def _read_json(p: Path) -> dict[str, Any]:
