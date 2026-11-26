@@ -94,10 +94,29 @@ async def main() -> int:
         r["cfg"] = await G("config", "set", "agents.max_alive", "1", "--as", "moxxie")
         r["cfg_applied"] = await until(lambda: swarm.cfg.section("agents").get("max_alive") == 1)
         r["cfg_persisted"] = json.loads(cfg_path.read_text())["agents"]["max_alive"] == 1
+
+        # MCP servers change live: set, disable, enable, rm (docs/CONTROL.md)
+        from gek.cli import send_control
+        calc = {"command": sys.executable, "args": ["-c", "print(1)"]}
+        gen0 = getattr(swarm, "mcp_generation", 0)
+        await send_control(cfg, "moxxie", "mcp set calc", "add a server", json.dumps(calc))
+        r["mcp_set"] = await until(lambda: (swarm.cfg.raw.get("mcp_servers") or {}).get("calc", {})
+                                   .get("command") == sys.executable)
+        r["mcp_gen"] = getattr(swarm, "mcp_generation", 0) > gen0
+        r["mcp_persisted"] = ((json.loads(cfg_path.read_text()).get("mcp_servers") or {}).get("calc") or {}).get(
+            "args") == ["-c", "print(1)"]
+        await send_control(cfg, "moxxie", "mcp disable calc", "not needed yet")
+        r["mcp_disabled"] = await until(lambda: (swarm.cfg.raw.get("mcp_servers") or {}).get("calc", {})
+                                        .get("enabled") is False)
+        await send_control(cfg, "moxxie", "mcp enable calc", "needed again")
+        r["mcp_enabled"] = await until(lambda: (swarm.cfg.raw.get("mcp_servers") or {}).get("calc", {})
+                                       .get("enabled") is not False)
+        await send_control(cfg, "moxxie", "mcp rm calc", "gone for good")
+        r["mcp_rm"] = await until(lambda: "calc" not in (swarm.cfg.raw.get("mcp_servers") or {}))
+        r["mcp_rm_persisted"] = "calc" not in (json.loads(cfg_path.read_text()).get("mcp_servers") or {})
         r["spawn2"] = await G("spawn", "worker", "--as", "moxxie")  # over max_alive: must fail
         r["cold_cli"] = await G("config", "set", "swarm_dir", '"elsewhere"')
 
-        from gek.cli import send_control
         await send_control(cfg, "moxxie", "config set api.api_key_env", "sneaky", '"X"')
         r["ceiling_no_yes"] = await G("config", "set", "ceiling.merge", "false")
         r["ceiling"] = await G("config", "set", "ceiling.merge", "false", "--yes", "--as", "moxxie")
@@ -146,6 +165,11 @@ async def main() -> int:
     off_mode = gek(cfg_path, "mode", "human")
     off_spawn = gek(cfg_path, "spawn", "scout")
     off_list = gek(cfg_path, "role", "list")
+    from gek.cli import do_control
+    off_mcp = await do_control(load_config(cfg_path), "moxxie", "mcp set calc", "set while stopped",
+                               json.dumps({"command": "uvx", "args": ["mcp-server-fetch"]}))
+    mid = json.loads(cfg_path.read_text())
+    off_mcp_rm = await do_control(load_config(cfg_path), "moxxie", "mcp rm calc", "rm while stopped")
     saved = json.loads(cfg_path.read_text())
 
     ev = [json.loads(l) for l in open(log.dir / "events.jsonl")]
@@ -179,7 +203,24 @@ async def main() -> int:
         "back to llm wakes the model": r["llm_wakes"],
         "briefing lists outside actions": "Outside actions since your last wake" in last_brief
                                           and "moxxie: spawn worker" in last_brief
-                                          and "config.json edited by hand" in last_brief,
+                                          and "config.json edited by hand" in last_brief
+                                          and "moxxie: mcp set calc" in last_brief,
+        "mcp set applied live": r["mcp_set"],
+        "mcp set bumps the generation live agents sync on": r["mcp_gen"],
+        "mcp set persisted": r["mcp_persisted"],
+        "mcp disable applied live": r["mcp_disabled"],
+        "mcp enable applied live": r["mcp_enabled"],
+        "mcp rm applied live": r["mcp_rm"],
+        "mcp rm persisted": r["mcp_rm_persisted"],
+        "mcp commands are on the record": any(c["data"]["verb"] == "mcp" and c["data"]["ok"]
+                                              and c["data"]["arg"].split(" ")[0] in ("set", "rm", "enable", "disable")
+                                              for c in controls)
+                                          and any(e["kind"] == "config" and e["data"]["key"].startswith("mcp_servers")
+                                                  for e in ev),
+        "offline mcp set saves for the next run": off_mcp[0] == 0 and "applies on the next run" in off_mcp[1]
+                                                  and (mid.get("mcp_servers") or {}).get("calc", {}).get("command") == "uvx",
+        "offline mcp rm saves for the next run": off_mcp_rm[0] == 0 and "applies on the next run" in off_mcp_rm[1]
+                                                 and "calc" not in (saved.get("mcp_servers") or {}),
         "halt": reason.startswith("halted by moxxie"),
         "offline role set": off_role[0] == 0 and "scout" in off_list[1],
         "offline config set": off_cfg[0] == 0 and saved["agents"]["max_steps"] == 77,

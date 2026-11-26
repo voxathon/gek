@@ -1,5 +1,5 @@
 """Steering a running swarm from outside: `gek kill`, `gek halt`, plain inbox messages,
-and `gek push`. Scripted fake model, no API key.
+`mcp set` as a Control: commit, and `gek push`. Scripted fake model, no API key.
 
     uv run python tests/control.py
 """
@@ -77,6 +77,13 @@ async def main() -> int:
         victim = swarm.alive()[0].id
         res["victim"] = victim
         res["inbox"] = await asyncio.to_thread(gek, cfg_path, "inbox", "how's it going?", "--as", "moxxie")
+        from gek.cli import send_control
+        res["mcp"] = await send_control(cfg, "moxxie", "mcp set calc", "add a server after the fact",
+                                        json.dumps({"command": sys.executable, "args": ["-c", "print(1)"]}))
+        for _ in range(100):
+            if "calc" in (swarm.cfg.raw.get("mcp_servers") or {}):
+                break
+            await asyncio.sleep(0.1)
         res["kill"] = await asyncio.to_thread(gek, cfg_path, "kill", victim, "too slow", "--as", "moxxie")
         for _ in range(100):
             if swarm.agents[victim].status == "killed":
@@ -101,13 +108,20 @@ async def main() -> int:
     ev = [json.loads(l) for l in open(log.dir / "events.jsonl")]
     exits = {e["actor"]: e["data"] for e in ev if e["kind"] == "agent_exit"}
     controls = [e for e in ev if e["kind"] == "control"]
+    inbox = subprocess.run(["git", "--git-dir", str(cfg.repo_dir), "log", "--format=%B", "swarm/inbox"],
+                           capture_output=True, text=True).stdout
     victim = res["victim"]
     checks = {
         "kill lands": exits.get(victim, {}).get("how") == "killed",
         "kill is on the record as moxxie": any(e["kind"] == "agent_kill" and e["actor"] == "moxxie"
                                               and e["data"]["target"] == victim for e in ev),
-        "control events logged": {c["data"]["verb"] for c in controls} == {"kill", "halt"},
+        "control events logged": {c["data"]["verb"] for c in controls} == {"kill", "halt", "mcp"},
         "plain inbox still wakes": any(e["kind"] == "inbox" and e["data"].get("external") for e in ev),
+        "mcp set is a Control: commit on the inbox": "Control: mcp set calc" in inbox and "From: moxxie" in inbox,
+        "mcp set reaches the harness": any(c["data"]["verb"] == "mcp" and c["data"]["arg"] == "set calc"
+                                           and c["data"]["ok"] for c in controls),
+        "mcp set changes the running swarm's config": (swarm.cfg.raw.get("mcp_servers") or {}).get("calc", {}) \
+            .get("args") == ["-c", "print(1)"],
         "halt stops the swarm": reason.startswith("halted by moxxie"),
         "halt kills the rest": all(d.get("how") == "killed" for d in exits.values()) and len(exits) == 2,
         "push main": "gek/" in pushed and "/main" in branches,
