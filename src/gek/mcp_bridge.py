@@ -121,7 +121,9 @@ class MCPBridge:
                 self.sessions[server] = session
                 self.tools.update(tools)
                 self.listed.extend(made)
-                event: dict[str, Any] = {"server": server, "ok": True, "kind": kind}
+                # "kind" is the log channel (RunLog.event's first positional); the transport
+                # goes under "transport" so it can never collide with it.
+                event: dict[str, Any] = {"server": server, "ok": True, "transport": kind}
                 if kind == "remote":
                     event["transport"] = mcp_transport(spec)
                     event["host"] = _host(mcp_endpoint(spec))
@@ -129,7 +131,7 @@ class MCPBridge:
                 self.log.event("mcp", self.actor, listed=[t.name for t in listed.tools],
                                granted=kept, **event)
             except BaseException as e:
-                event = {"server": server, "ok": False, "kind": kind,
+                event = {"server": server, "ok": False, "transport": kind,
                          "error": f"{type(e).__name__}: {self._safe(e, spec)}"}
                 if kind == "remote":
                     event["transport"] = mcp_transport(spec)
