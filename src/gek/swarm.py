@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import secrets
 import sys
@@ -17,11 +18,22 @@ from .gitrepo import CHATTER, INBOX, MAIN, ROLES, Identity, Repo
 from .llm import LLM, BudgetExceeded
 from .logs import RunLog
 from .prompts import ORCHESTRATOR_PRIOR
-from .config import flatten, get_path, is_hot, parse_value, persist_key, set_path
+from .config import (flatten, get_path, is_hot, mcp_edit, mcp_entry, mcp_servers, parse_value,
+                       persist_key, set_path)
 from .roles import Role, validate
 from .tools import B, I, S, ToolBox, arr, obj
 
 ORCH = "orchestrator"
+
+
+def mcp_entry_summary(servers: Any) -> dict[str, Any]:
+    """What gets logged about mcp_servers: names, enabled flags, the command -- never env values."""
+    out: dict[str, Any] = {}
+    for name, spec in mcp_servers(servers, only_enabled=False).items():
+        e = mcp_entry(spec)
+        out[name] = {"enabled": e["enabled"], "command": os.path.basename(e.get("command", "")),
+                     "n_tools_env": len(e.get("env") or {})}
+    return out
 
 
 def _trailers(t: dict[str, str]) -> str:
@@ -66,6 +78,10 @@ class Swarm:
         self.resumed.set()
         self.outside: list[str] = []  # outside actions since the orchestrator's last wake
         self._cfg_mtime = self._mtime()
+        # Bumped whenever mcp_servers (or the ceiling that gates it) changes. Agents hold the
+        # value they connected at and reconnect their MCP bridge between steps when it moves,
+        # in their own task (anyio cancel scopes require open/close in one task).
+        self.mcp_generation = 0
         self.resume = resume  # resume.ResumeInfo when this run picks up an earlier one
         self.respawn = respawn
         if resume is not None:
@@ -110,6 +126,10 @@ class Swarm:
             if bad:
                 line += ". Roles now above the ceiling (live agents keep their powers): " + ", ".join(bad)
                 self.log.event("note", "harness", roles_above_ceiling=bad)
+        if key == "mcp_servers" or key.startswith("mcp_servers.") or key.startswith("ceiling"):
+            self.mcp_generation += 1
+            self.log.event("mcp", "harness", generation=self.mcp_generation, key=key,
+                           servers=mcp_entry_summary(self.cfg.raw.get("mcp_servers")), author=author)
         if key == "orchestrator.mode" or (key == "orchestrator" and isinstance(value, dict)):
             self.log.event("mode", author, mode=self.mode)
             if self.mode == "llm":
@@ -127,9 +147,18 @@ class Swarm:
             self.log.event("note", "file", error=f"config.json changed but can't be read: {e}")
             return
         old_flat, new_flat = flatten(self.cfg.raw), flatten(fresh)
-        for key in sorted(set(old_flat) | set(new_flat)):
-            if old_flat.get(key) == new_flat.get(key):
-                continue
+        changed = {k for k in set(old_flat) | set(new_flat) if old_flat.get(k) != new_flat.get(k)}
+        # mcp_servers as a whole: a hand edit of one leaf (or a removed server) is one live change,
+        # so agents reconnect once. Applying leaves would also leave a half-applied server behind.
+        if any(k == "mcp_servers" or k.startswith("mcp_servers.") for k in changed):
+            try:
+                line = await self.apply_config("mcp_servers", fresh.get("mcp_servers", {}), "file",
+                                               persist=False)
+                self.outside.append(f"config.json edited by hand: {line}")
+                changed = {k for k in changed if not (k == "mcp_servers" or k.startswith("mcp_servers."))}
+            except ValueError as e:
+                self.log.event("config", "file", key="mcp_servers", refused=str(e))
+        for key in sorted(changed):
             try:
                 line = await self.apply_config(key, get_path(fresh, key), "file", persist=False)
                 self.outside.append(f"config.json edited by hand: {line}")
@@ -460,6 +489,31 @@ class Swarm:
                     self.log.event("inbox", author, message=message, sha=sha, external=True)
                     self.request_wake(f"inbox from {author}")
 
+    async def apply_mcp(self, arg: str, payload: str, author: str) -> str:
+        """`mcp set|rm|enable|disable <name>` from the control plane: apply live (and persist), then
+        tell the agents to reconnect. Returns a line for the human."""
+        action, _, name = arg.strip().partition(" ")
+        action, name = action.strip(), name.strip()
+        if action not in ("set", "rm", "enable", "disable") or not name:
+            raise ValueError("mcp needs `mcp set|rm|enable|disable <name>`"
+                             + (" (set also needs the entry as JSON in the body)" if action == "set" else ""))
+        entry = None
+        if action == "set":
+            if not payload:
+                raise ValueError(f"mcp set {name} needs the server entry (JSON) in the body")
+            text = payload[payload.find("{"): payload.rfind("}") + 1]
+            if not text:
+                raise ValueError(f"mcp set {name} needs the server entry (JSON) in the body")
+            try:
+                entry = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"mcp set {name}: the entry isn't valid JSON: {e}")
+        servers = mcp_edit(self.cfg.raw.get("mcp_servers"), action, name, entry)
+        line = await self.apply_config("mcp_servers", servers, author)
+        n = len(mcp_servers(servers))
+        line += f" ({n} mcp server{'s' if n != 1 else ''} enabled; live agents reconnect between steps)"
+        return line
+
     async def _control(self, author: str, control: str, reason: str, payload: str, sha: str) -> None:
         """Carry out one Control: command (docs/CONTROL.md)."""
         verb, _, arg = control.strip().partition(" ")
@@ -498,6 +552,8 @@ class Swarm:
                     raise ValueError("config set needs the value (JSON) in the body")
                 value = parse_value(payload)
                 result = await self.apply_config(key, value, author)
+            elif verb == "mcp":
+                result = await self.apply_mcp(arg, payload, author)
             elif verb == "mode" and arg in ("llm", "human"):
                 result = await self.apply_config("orchestrator.mode", arg, author)
             elif verb == "pause":
