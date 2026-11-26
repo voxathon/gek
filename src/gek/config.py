@@ -17,6 +17,10 @@ Config layering: built-in defaults <- ~/.gek/config.json <- the swarm's config.j
 (portable swarms skip the shared layer). .env files: the swarm folder, then GEK_HOME
 (home swarms only), then the current directory;
 variables already set in the environment always win.
+
+MCP servers (mcp_servers) are either local (stdio: command/args/env/cwd) or remote (url,
+transport, headers). Remote header values are "${ENV:NAME}" placeholders: they live in .env and
+are expanded only at connect time by mcp_resolve_headers() -- never stored, logged or displayed.
 """
 
 from __future__ import annotations
@@ -91,9 +95,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mcp": {},
     },
     "mcp_servers": {
-        "_comment": "name -> {command, args, env, cwd, timeout_s, enabled}. Grant them to "
-                    "roles via ceiling.mcp. Live: edits apply to a running swarm (agents "
-                    "reconnect between steps). Never put secrets here.",
+        "_comment": "name -> a local {command, args, env, cwd, timeout_s, enabled} or a remote "
+                    "{url, transport, headers, timeout_s, enabled} server (exactly one of command "
+                    "| url). Grant them to roles via ceiling.mcp. Live: edits apply to a running "
+                    "swarm (agents reconnect between steps). Never put secrets here: remote header "
+                    'values are "${ENV:NAME}" placeholders resolved from .env at connect time.',
     },
     "plugins": {
         "_comment": "name -> its config; only plugins named here load. Bundled: notify (see README).",
@@ -207,7 +213,8 @@ class Config:
 
     def redacted(self) -> dict[str, Any]:
         """Config as logged/displayed: config.json never holds secrets, but env names are noted.
-        MCP server `env` values are masked (display only; self.raw keeps them)."""
+        MCP server `env` values (stdio) and `headers` values (remote) are masked (display only;
+        self.raw keeps them)."""
         api = self.raw.get("api", {})
         return {
             **self.raw,
@@ -219,12 +226,31 @@ class Config:
 
 
 # ------------------------------------------------------------- mcp servers
-# mcp_servers = {name: {command, args, env, cwd, timeout_s, enabled}}; `_`-prefixed keys are
-# comments (see write_default_config). Every entry is hot: it is applied to a running swarm and
-# live agents reconnect their MCP bridge between steps. Never put secrets in config.json: env
-# values are redacted for display/logs (redacted()), names stay.
-MCP_FIELDS = ("command", "args", "env", "cwd", "timeout_s", "enabled")
+# mcp_servers = {name: entry}; `_`-prefixed keys are comments (see write_default_config).
+# An entry is EITHER stdio (command/args/env/cwd) OR remote (url/transport/headers): exactly one
+# of `command` | `url`. Every entry is hot: it is applied to a running swarm and live agents
+# reconnect their MCP bridge between steps. Never put secrets in config.json: a remote server's
+# header values are "${ENV:NAME}" placeholders resolved at connect time (mcp_resolve_headers);
+# display and logs show names only (redacted()). A stdio server's `env` values stay masked too.
+MCP_STDIO_FIELDS = ("command", "args", "env", "cwd", "timeout_s", "enabled")
+MCP_REMOTE_FIELDS = ("url", "transport", "headers", "timeout_s", "enabled")
+MCP_FIELDS = tuple(sorted(set(MCP_STDIO_FIELDS) | set(MCP_REMOTE_FIELDS)))
+MCP_TRANSPORTS = ("streamable-http", "sse")
+MCP_DEFAULT_TIMEOUT_S = 60
+MCP_PLACEHOLDER = re.compile(r"^\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}$")
 MCP_ACTIONS = ("set", "rm", "enable", "disable")
+MCP_KINDS = ("stdio", "remote")
+
+
+def _mcp_label(name: str = "") -> str:
+    return f"mcp server {name!r}" if name else "mcp server"
+
+
+def _mcp_comments(spec: Any) -> dict[str, Any]:
+    """`_`-prefixed keys of one entry: comments, kept verbatim on every rewrite."""
+    if not isinstance(spec, dict):
+        return {}
+    return {str(k): v for k, v in spec.items() if str(k).startswith("_")}
 
 
 def mcp_names(servers: Any) -> list[str]:
@@ -232,45 +258,128 @@ def mcp_names(servers: Any) -> list[str]:
     return [str(k) for k in (servers or {}) if not str(k).startswith("_")]
 
 
+def mcp_kind(spec: Any) -> str:
+    """'remote' when the entry has a url, else 'stdio' (no validation: see shape_mcp_entry)."""
+    return "remote" if isinstance(spec, dict) and spec.get("url") else "stdio"
+
+
+def mcp_transport(spec: Any) -> str:
+    """The transport a remote entry asks for ('streamable-http' unless it says 'sse')."""
+    if mcp_kind(spec) != "remote":
+        return "stdio"
+    return str(spec.get("transport") or MCP_TRANSPORTS[0])
+
+
+def mcp_endpoint(spec: Any) -> str:
+    """How to recognise a server in a line of text: its url (remote) or its command (stdio)."""
+    spec = spec if isinstance(spec, dict) else {}
+    return str(spec.get("url") or spec.get("command") or "")
+
+
 def mcp_entry(spec: Any) -> dict[str, Any]:
-    """One server's normalized entry (defaults filled in). enabled defaults to True."""
+    """One server's normalized entry (defaults filled in; `_` comments dropped).
+
+    stdio -> {command, args?, env?, cwd?, timeout_s, enabled}
+    remote -> {url, transport, headers?, timeout_s, enabled}
+    Unknown (non-comment) keys are ignored here; shape_mcp_entry rejects them."""
     spec = spec if isinstance(spec, dict) else {}
     out: dict[str, Any] = {}
-    if spec.get("command"):
-        out["command"] = str(spec["command"])
-    if spec.get("args"):
-        out["args"] = [str(a) for a in spec["args"]]
-    if spec.get("env"):
-        out["env"] = {str(k): str(v) for k, v in spec["env"].items()}
-    if spec.get("cwd"):
-        out["cwd"] = str(spec["cwd"])
-    if spec.get("timeout_s"):
-        out["timeout_s"] = int(spec["timeout_s"])
+    if mcp_kind(spec) == "remote":
+        out["url"] = str(spec["url"])
+        out["transport"] = mcp_transport(spec)
+        if spec.get("headers"):
+            out["headers"] = {str(k): str(v) for k, v in spec["headers"].items()}
     else:
-        out["timeout_s"] = 60
+        if spec.get("command"):
+            out["command"] = str(spec["command"])
+        if spec.get("args"):
+            out["args"] = [str(a) for a in spec["args"]]
+        if spec.get("env"):
+            out["env"] = {str(k): str(v) for k, v in spec["env"].items()}
+        if spec.get("cwd"):
+            out["cwd"] = str(spec["cwd"])
+    try:
+        out["timeout_s"] = int(spec["timeout_s"]) if spec.get("timeout_s") else MCP_DEFAULT_TIMEOUT_S
+    except (TypeError, ValueError):
+        out["timeout_s"] = spec["timeout_s"]  # left as-is; shape_mcp_entry reports it
     out["enabled"] = bool(spec.get("enabled", True))
     return out
 
 
+def _validate_mcp_url(label: str, url: Any) -> str:
+    text = str(url or "").strip()
+    if not text:
+        raise ValueError(f"{label} needs a url (the remote MCP endpoint, e.g. "
+                         "https://example.com/mcp)")
+    scheme, sep, rest = text.partition("://")
+    if not sep or scheme.lower() not in ("http", "https") or not rest.strip("/"):
+        raise ValueError(f"{label}: url must be an http:// or https:// address, got {text!r}")
+    return text
+
+
+def _validate_mcp_headers(label: str, headers: Any) -> dict[str, str]:
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        raise ValueError(f"{label}: headers must be an object of NAME -> value "
+                         '({"Authorization": "${ENV:TOKEN}"}); secrets belong in .env')
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        hk, hv = str(k).strip(), str(v)
+        if not hk:
+            raise ValueError(f"{label}: header names must be non-empty")
+        if not hv.strip():
+            raise ValueError(f"{label}: header {hk!r} has an empty value")
+        out[hk] = hv
+    return out
+
+
 def shape_mcp_entry(spec: Any, name: str = "") -> dict[str, Any]:
-    """Validate one mcp_servers entry; raises ValueError. stdio only (a command to launch)."""
-    label = f"mcp server {name!r}" if name else "mcp server"
+    """Validate one mcp_servers entry; raises ValueError naming the server.
+
+    Exactly one of `command` (stdio) | `url` (remote) per entry. Remote keys: url (http/https),
+    transport in {streamable-http, sse} (default streamable-http), headers {name: "${ENV:NAME}"},
+    timeout_s, enabled. `_`-prefixed keys are comments and are preserved (not validated)."""
+    label = _mcp_label(name)
     if not isinstance(spec, dict):
         raise ValueError(f"{label} must be an object like "
-                         '{"command": "npx", "args": ["-y", "some-server"]}')
-    if spec.get("url") and not spec.get("command"):
-        raise ValueError(f"{label}: url/http servers aren't supported yet; give a command (stdio)")
-    unknown = [k for k in spec if str(k) not in MCP_FIELDS and k != "url"]
+                         '{"command": "npx", "args": ["-y", "some-server"]} for a local (stdio) '
+                         'server or {"url": "https://example.com/mcp"} for a remote one')
+    comments = _mcp_comments(spec)
+    has_command = bool(str(spec.get("command") or "").strip())
+    has_url = bool(str(spec.get("url") or "").strip())
+    if has_command and has_url:
+        raise ValueError(f"{label}: give either command (a local stdio server) or url (a remote "
+                         "server), not both")
+    if not has_command and not has_url:
+        raise ValueError(f"{label} needs a command (the program to launch, e.g. npx) or a url "
+                         "(a remote http(s) MCP endpoint)")
+    remote = has_url
+    allowed = MCP_REMOTE_FIELDS if remote else MCP_STDIO_FIELDS
+    unknown = [str(k) for k in spec if str(k) not in allowed and not str(k).startswith("_")]
     if unknown:
-        raise ValueError(f"{label}: unknown field(s) {', '.join(map(str, unknown))}; "
-                         f"allowed: {', '.join(MCP_FIELDS)} (stdio: command+args)")
-    if not str(spec.get("command") or "").strip():
-        raise ValueError(f"{label} needs a command (the program to launch, e.g. npx)")
-    out = mcp_entry(spec)
-    if not isinstance(spec.get("args", []), list):
-        raise ValueError(f"{label}: args must be a list of strings")
-    if not isinstance(spec.get("env", {}), dict):
-        raise ValueError(f"{label}: env must be an object of NAME -> value")
+        kind = "remote" if remote else "stdio"
+        raise ValueError(f"{label}: unknown field(s) {', '.join(unknown)} for a {kind} server; "
+                         f"allowed: {', '.join(allowed)} (and `_`-prefixed comments)")
+    if remote:
+        out: dict[str, Any] = {"url": _validate_mcp_url(label, spec.get("url"))}
+        transport = spec.get("transport") or MCP_TRANSPORTS[0]
+        if str(transport) not in MCP_TRANSPORTS:
+            raise ValueError(f"{label}: transport must be one of {', '.join(MCP_TRANSPORTS)}, "
+                             f"got {transport!r}")
+        out["transport"] = str(transport)
+        headers = _validate_mcp_headers(label, spec.get("headers"))
+        if headers:
+            out["headers"] = headers
+    else:
+        out = mcp_entry(spec)
+        if not isinstance(spec.get("args", []), list):
+            raise ValueError(f"{label}: args must be a list of strings")
+        if not isinstance(spec.get("env", {}), dict):
+            raise ValueError(f"{label}: env must be an object of NAME -> value")
+        if spec.get("cwd") is not None and not isinstance(spec.get("cwd"), str):
+            raise ValueError(f"{label}: cwd must be a path string")
+    out["timeout_s"] = mcp_entry(spec)["timeout_s"]  # 60 unless given; shape-checked next
     try:
         out["timeout_s"] = int(out["timeout_s"])
     except (TypeError, ValueError):
@@ -278,11 +387,11 @@ def shape_mcp_entry(spec: Any, name: str = "") -> dict[str, Any]:
     if out["timeout_s"] <= 0:
         raise ValueError(f"{label}: timeout_s must be positive")
     out["enabled"] = bool(spec.get("enabled", True))
-    return out
+    return {**comments, **out}
 
 
 def mcp_servers(raw: Any, only_enabled: bool = True) -> dict[str, Any]:
-    """The servers a bridge should connect to (enabled ones by default)."""
+    """The servers a bridge should connect to (enabled ones by default), spec untouched."""
     out = {}
     for name in mcp_names(raw):
         spec = (raw or {}).get(name)
@@ -297,8 +406,9 @@ def mcp_servers(raw: Any, only_enabled: bool = True) -> dict[str, Any]:
 def mcp_edit(raw_servers: Any, action: str, name: str, entry: Any = None) -> dict[str, Any]:
     """Return a NEW mcp_servers dict with one change applied (used by `mcp set|rm|enable|disable`).
 
-    Keeps `_`-prefixed comment keys and every other server untouched, so this can be persisted
-    as a whole with persist_key(path, "mcp_servers", result)."""
+    Keeps `_`-prefixed comment keys (of the dict and of the edited entry) and every other server
+    untouched, so this can be persisted as a whole with persist_key(path, "mcp_servers", result).
+    Works the same for stdio and remote entries."""
     if not NAME_OK.match(str(name or "")):
         raise ValueError(f"{name!r} isn't a valid server name (letters, digits, _.-; "
                          "no dots-only/comment names)")
@@ -313,20 +423,75 @@ def mcp_edit(raw_servers: Any, action: str, name: str, entry: Any = None) -> dic
         raise ValueError(f"no mcp server {name!r} in mcp_servers")
     if action == "rm":
         del cur[name]
-    else:
-        spec = cur[name] if isinstance(cur[name], dict) else {"command": ""}
-        cur[name] = {**spec, "enabled": action == "enable"}
+        return cur
+    spec = cur[name] if isinstance(cur[name], dict) else {}
+    kind = mcp_kind(spec)
+    try:
+        shaped = shape_mcp_entry({**spec, "enabled": action == "enable"}, name)
+    except ValueError as e:
+        raise ValueError(f"{name!r} can't be {action}d: {e}")
+    cur[name] = {**_mcp_comments(spec), **shaped}
     return cur
 
 
 def redact_mcp(servers: Any) -> dict[str, Any]:
-    """A copy of mcp_servers with env VALUES masked (names kept) for display and logs."""
+    """A copy of mcp_servers with secret VALUES masked (names kept) for display and logs.
+
+    stdio `env` values -> "***"; remote `headers` values -> "***" (the header names stay, so a log
+    still says which secret a server expects). self.raw is never touched."""
     out: dict[str, Any] = {}
     for name, spec in (servers or {}).items():
-        if isinstance(spec, dict) and isinstance(spec.get("env"), dict):
-            out[name] = {**spec, "env": {str(k): "***" for k in spec["env"]}}
+        if isinstance(spec, dict) and (isinstance(spec.get("env"), dict)
+                                       or isinstance(spec.get("headers"), dict)):
+            masked = dict(spec)
+            if isinstance(spec.get("env"), dict):
+                masked["env"] = {str(k): "***" for k in spec["env"]}
+            if isinstance(spec.get("headers"), dict):
+                masked["headers"] = {str(k): "***" for k in spec["headers"]}
+            out[name] = masked
         else:
             out[name] = spec
+    return out
+
+
+def mcp_header_env_names(spec: Any) -> list[str]:
+    """Env var names a remote entry's headers need (placeholders only; sorted, no values)."""
+    spec = spec if isinstance(spec, dict) else {}
+    names: list[str] = []
+    for value in (spec.get("headers") or {}).values():
+        m = MCP_PLACEHOLDER.match(str(value))
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    return sorted(names)
+
+
+def mcp_resolve_headers(spec: Any, environ: Any = None,
+                        name: str = "") -> dict[str, str]:
+    """The concrete headers for a remote entry, at connect time. Values never reach logs.
+
+    Header values may be "${ENV:NAME}" placeholders and are expanded from `environ` (default
+    os.environ -- the harness env, where .env has already been loaded). A placeholder whose
+    variable is missing or empty raises ValueError naming the server and the variable but never a
+    value. Literal (non-placeholder) values are passed through, so a header that isn't a secret
+    keeps working. Remote entries only: a stdio entry has no headers."""
+    label = _mcp_label(name)
+    spec = spec if isinstance(spec, dict) else {}
+    if mcp_kind(spec) != "remote":
+        return {}
+    env = os.environ if environ is None else environ
+    out: dict[str, str] = {}
+    for key, raw in (spec.get("headers") or {}).items():
+        text = str(raw)
+        m = MCP_PLACEHOLDER.match(text)
+        if not m:
+            out[str(key)] = text
+            continue
+        var = m.group(1)
+        value = env.get(var) if hasattr(env, "get") else None
+        if not value:
+            raise ValueError(f"{label}: header {key!r} needs ${var} from the environment "
+                             f"(put {var}=... in .env); it is missing or empty")
+        out[str(key)] = str(value)
     return out
 
 
