@@ -531,6 +531,306 @@ class PluginsScreen(Screen):
         self.action_edit()
 
 
+# ------------------------------------------------------------------- mcp servers
+# An MCP server is one entry of the top-level `mcp_servers` dict: stdio ones have command/args
+# (plus env, cwd), streamable-http ones have a url. Every `mcp_servers.*` key is hot, so a change
+# rides the control plane into the running swarm and the agents reconnect; no restart. Nothing
+# here writes config.json: a not-running swarm gets the cli's offline branch of do_control.
+MCP_FIELDS = ("command", "args", "env", "cwd", "url", "timeout_s", "enabled")
+
+
+def _mcp_servers(cfg: Config) -> dict[str, dict]:
+    """The configured servers, minus _comment keys; a bare string entry means {"command": it}."""
+    out: dict[str, dict] = {}
+    for name, spec in (cfg.raw.get("mcp_servers") or {}).items():
+        if str(name).startswith("_"):
+            continue
+        if isinstance(spec, dict):
+            out[str(name)] = dict(spec)
+        elif isinstance(spec, str):
+            out[str(name)] = {"command": spec}
+        else:
+            out[str(name)] = {}
+    return out
+
+
+def _mcp_endpoint(spec: dict | None) -> str:
+    if not spec:
+        return "-"
+    if spec.get("url"):
+        return str(spec["url"])
+    parts = [str(spec.get("command") or "?")] + [str(a) for a in spec.get("args") or []]
+    return " ".join(parts)
+
+
+def _mcp_run_state(run) -> dict[str, dict]:
+    """What the run viewed behind this screen says about each server (empty when no run)."""
+    return dict(getattr(run, "mcp", None) or {})
+
+
+class McpEditScreen(_Form):
+    """One MCP server. stdio: command + args (+ env, cwd). http: url. Keys we don't show survive."""
+
+    def __init__(self, name: str, spec: dict):
+        super().__init__()
+        self.name_ = name
+        self.spec = dict(spec or {})
+        self.extra = {k: v for k, v in self.spec.items() if k not in MCP_FIELDS}
+
+    def compose(self) -> ComposeResult:
+        args = self.spec.get("args") or []
+        env = self.spec.get("env") or {}
+        with Vertical(id="form"):
+            yield Label(Text(f"mcp_servers.{self.name_}", style="bold"))
+            yield Label("command (stdio: e.g. uvx, npx). Leave blank for an http server.")
+            yield Input(value=str(self.spec.get("command") or ""), id="cmd")
+            yield Label("args (spaced, or a JSON list)")
+            yield Input(value=" ".join(str(a) for a in args), id="args")
+            yield Label('env (JSON object, e.g. {"API_KEY": "..."})')
+            yield Input(value=json.dumps(env) if env else "", id="env")
+            yield Label("cwd (optional)")
+            yield Input(value=str(self.spec.get("cwd") or ""), id="cwd")
+            yield Label("url (http servers only)")
+            yield Input(value=str(self.spec.get("url") or ""), id="url")
+            yield Label("timeout_s (how long connecting may take; default 60)")
+            yield Input(value=str(self.spec.get("timeout_s") or ""), id="timeout")
+            yield Checkbox("enabled (off = configured, but never connected)", id="enabled",
+                           value=self.spec.get("enabled") is not False)
+            if self.extra:
+                yield Label(Text("kept as-is: " + ", ".join(sorted(self.extra)), style="dim"))
+            yield Label("", id="err", classes="err")
+            with Horizontal(id="buttons"):
+                yield Button("Save", variant="primary", id="ok")
+                if self.spec:
+                    yield Button("Remove", id="del", variant="error")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#cmd", Input).focus()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "del":
+            self.dismiss("delete")
+        else:
+            await super().on_button_pressed(event)
+
+    async def submit(self) -> None:
+        import shlex
+
+        conf = dict(self.extra)  # anything we don't show round-trips untouched
+        command = self.query_one("#cmd", Input).value.strip()
+        url = self.query_one("#url", Input).value.strip()
+        if not command and not url:
+            self._err("a command (stdio) or a url (http) is needed")
+            return
+        if command:
+            conf["command"] = command
+        raw_args = self.query_one("#args", Input).value.strip()
+        if raw_args:
+            if raw_args.startswith("["):
+                parsed = json.loads(raw_args)
+                if not isinstance(parsed, list):
+                    raise ValueError('args as JSON must be a list, e.g. ["--root", "/tmp"]')
+                conf["args"] = [str(a) for a in parsed]
+            else:
+                conf["args"] = shlex.split(raw_args)
+        raw_env = self.query_one("#env", Input).value.strip()
+        if raw_env:
+            parsed_env = json.loads(raw_env)
+            if not isinstance(parsed_env, dict):
+                raise ValueError('env must be a JSON object, e.g. {"API_KEY": "sk-..."}')
+            conf["env"] = {str(k): str(v) for k, v in parsed_env.items()}
+        cwd = self.query_one("#cwd", Input).value.strip()
+        if cwd:
+            conf["cwd"] = cwd
+        if url:
+            conf["url"] = url
+        timeout = self.query_one("#timeout", Input).value.strip()
+        if timeout:
+            conf["timeout_s"] = float(timeout)
+        if self.query_one("#enabled", Checkbox).value:
+            conf.pop("enabled", None)  # enabled is the default; a missing key keeps the JSON small
+        else:
+            conf["enabled"] = False
+        self.dismiss(conf)
+
+
+class McpScreen(Screen):
+    """MCP servers: what's configured, what this run connected, and live enable/disable/edit.
+
+    Shaped like PluginsScreen, but every change is an audited control-plane action (do_control),
+    so it lands in the orchestrator's outside-actions briefing and applies without a restart.
+    """
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "back"),
+        Binding("space", "toggle", "enable/disable"),
+        Binding("e", "edit", "edit"),
+        Binding("enter", "edit", "edit", show=False),
+        Binding("a", "new", "add"),
+        Binding("x", "remove", "remove"),
+    ]
+    CSS = """
+    #m-note { height: auto; padding: 0 1; }
+    #m-detail { height: auto; max-height: 9; padding: 0 1; background: $boost; }
+    """
+
+    def __init__(self, cfg: Config, run=None):
+        super().__init__()
+        self.cfg = cfg
+        self.run = run  # RunData of the run being viewed; its mcp events say what connected
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="m-note")
+        yield DataTable(id="m-table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="m-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#m-table", DataTable).add_columns("name", "endpoint", "tools", "enabled", "live")
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        from .cli import is_running
+
+        self.cfg = _reload(self.cfg)
+        conf = _mcp_servers(self.cfg)
+        live = _mcp_run_state(self.run)
+        t = self.query_one("#m-table", DataTable)
+        keep = t.cursor_row
+        t.clear()
+        for name in sorted(set(conf) | set(live)):
+            spec = conf.get(name)
+            if spec is None:
+                enabled = Text("not configured", style="dim")
+                endpoint = Text(_mcp_endpoint(live[name] if isinstance(live.get(name), dict) else None),
+                                style="dim")
+            else:
+                enabled = (Text("disabled", style="yellow") if spec.get("enabled") is False
+                           else Text("enabled", style="green"))
+                endpoint = Text(_mcp_endpoint(spec)[:48], style="dim")
+            st = live.get(name) or {}
+            if st.get("ok"):
+                lstate = Text("connected", style="green")
+            elif st.get("error"):
+                lstate = Text("failed", style="red")
+            else:
+                lstate = Text("-", style="dim")
+            granted, listed = st.get("granted") or [], st.get("listed") or []
+            if granted:
+                tools = Text(", ".join(granted)[:52])
+            elif listed:
+                tools = Text(f"{len(listed)} listed, none granted", style="yellow")
+            else:
+                tools = Text("-", style="dim")
+            t.add_row(name, endpoint, tools, enabled, lstate, key=name)
+        if t.row_count:
+            t.move_cursor(row=min(keep, t.row_count - 1))
+        running = is_running(self.cfg)
+        where = ("running, changes apply now (agents reconnect)"
+                 if running else "not running, changes apply next run")
+        self.query_one("#m-note", Static).update(Text.assemble(
+            (f"{self.cfg.name} MCP servers", "bold"),
+            "  |  space: enable/disable, e/enter: edit, a: add, x: remove  |  ",
+            (where, "yellow" if running else "dim")))
+        self._detail()
+
+    def _selected(self) -> str | None:
+        t = self.query_one("#m-table", DataTable)
+        if not t.row_count:
+            return None
+        return str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+
+    def _detail(self) -> None:
+        name = self._selected()
+        box = self.query_one("#m-detail", Static)
+        if not name:
+            box.update(Text("no MCP servers configured. a adds one: a command (+ args) for stdio, "
+                            "or a url for streamable-http. Grant a server to a role with "
+                            "powers.mcp: {server: [tool globs]}.", style="dim"))
+            return
+        spec = _mcp_servers(self.cfg).get(name)
+        st = _mcp_run_state(self.run).get(name) or {}
+        out = Text()
+        out.append(name, style="bold")
+        out.append(f"  {_mcp_endpoint(spec) if spec else 'not in mcp_servers'}\n", style="dim")
+        if spec:
+            out.append("config: " + json.dumps(spec)[:300] + "\n")
+        if st.get("granted"):
+            out.append("tools this run: " + ", ".join(st["granted"])[:200] + "\n")
+        if st.get("listed"):
+            out.append(f"listed by the server: {len(st['listed'])}\n", style="dim")
+        if st.get("error"):
+            out.append("error: " + str(st["error"])[:200] + "\n", style="red")
+        box.update(out)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._detail()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        event.stop()
+        self.action_edit()
+
+    async def _control(self, control: str, reason: str, payload: str = "") -> None:
+        from .cli import do_control
+
+        try:
+            msg = await do_control(self.cfg, WHO, control, reason, payload)
+        except Exception as e:
+            text = str(e)
+            if "isn't running" in text:
+                text += "  (start it with R: MCP servers connect at run start)"
+            self.notify(text, severity="error")
+            return
+        self.notify(msg)
+        self.set_timer(1.5, self.refresh_table)  # a running swarm applies it within a few seconds
+
+    async def action_toggle(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+        spec = _mcp_servers(self.cfg).get(name)
+        if spec is None:
+            self.notify(f"{name} is not in mcp_servers yet: press e to configure it", severity="warning")
+            return
+        verb = "enable" if spec.get("enabled") is False else "disable"
+        await self._control(f"mcp {verb} {name}", f"{verb}d from the TUI")
+
+    def action_edit(self) -> None:
+        name = self._selected()
+        if not name:
+            return
+        self._edit(name, _mcp_servers(self.cfg).get(name) or {})
+
+    async def action_remove(self) -> None:
+        name = self._selected()
+        if not name or name not in _mcp_servers(self.cfg):
+            return
+        await self._control(f"mcp rm {name}", "removed from the TUI")
+
+    def action_new(self) -> None:
+        from .tui import PromptScreen
+
+        def done(value: str | None) -> None:
+            name = (value or "").strip()
+            if name:
+                self.app.call_after_refresh(lambda: self._edit(name, {}))
+
+        self.push_screen(PromptScreen("Name for the new MCP server (e.g. files), Enter to configure:"),
+                         done)
+
+    def _edit(self, name: str, spec: dict) -> None:
+        def done(res) -> None:
+            if isinstance(res, dict):
+                self.run_worker(self._control(f"mcp set {name}", f"set {name} from the TUI",
+                                              json.dumps(res)))
+            elif res == "delete":
+                self.run_worker(self._control(f"mcp rm {name}", "removed from the TUI"))
+
+        self.app.push_screen(McpEditScreen(name, spec), done)
+
+
 # ------------------------------------------------------------------- resume
 class ResumeScreen(_Form):
     """What the last run left behind, before resuming it."""

@@ -77,6 +77,7 @@ class RunData:
     compaction_list: list[tuple[float, str, int, int, int]] = field(default_factory=list)  # t, actor, step, before, after
     compact_notes: dict = field(default_factory=dict)  # (actor, step) -> (before, after)
     plugins: dict = field(default_factory=dict)        # name -> what this run's events say about it
+    mcp: dict = field(default_factory=dict)            # server -> what this run's events say about it
     role_compact_at: dict = field(default_factory=dict)  # role -> compact_at, from role_written
     events: int = 0
     _partial: str = ""
@@ -188,6 +189,16 @@ class RunData:
             else:
                 p["last"] = ", ".join(f"{k2}={v}" for k2, v in d.items())[:120]
                 p["last_t"] = t
+        elif k == "mcp":
+            # per-agent connect attempts: server, ok, listed (offered), granted (kept for the role)
+            s = self.mcp.setdefault(d.get("server", "?"), {})
+            if d.get("closing"):
+                pass
+            elif d.get("ok"):
+                s.update(ok=True, error="", listed=d.get("listed") or [], granted=d.get("granted") or [],
+                         actor=actor)
+            else:
+                s.update(ok=False, error=d.get("error", ""), actor=actor)
         elif k == "tool_call":
             self._agent(actor).last = d.get("name", "")
         elif k == "commit" and not str(d.get("ref", "")).startswith("swarm/"):
@@ -570,6 +581,7 @@ class GekTUI(App):
         Binding("P", "push", "push", show=False),
         Binding("H", "halt", "halt"),
         Binding("L", "plugins", "plugins"),
+        Binding("M", "mcp", "mcp"),
         Binding("U", "resume_review", "resume"),
     ]
 
@@ -595,6 +607,7 @@ class GekTUI(App):
             ("Config", "view and change settings live", self.action_config),
             ("Push", "push swarm work to a git remote", self.action_push),
             ("Plugins", "installed vs enabled plugins; enable, disable, edit their config", self.action_plugins),
+            ("MCP servers", "view, add, enable/disable MCP servers live", self.action_mcp),
             ("Resume (review first)", "see what the last run left behind, then resume", self.action_resume_review),
         ]:
             yield SystemCommand(title, help_, action)
@@ -647,6 +660,15 @@ class GekTUI(App):
 
         if self.cfg is not None:
             self.push_screen(PluginsScreen(self.cfg, self.cur))
+
+    def action_mcp(self) -> None:
+        from .tui_control import McpScreen
+
+        if self.cfg is None:
+            self.notify("start the swarm first (R)", severity="warning")
+            return
+        # the screen saves through do_control, which needs no live swarm: offline it saves for next run
+        self.push_screen(McpScreen(self.cfg, self.cur), lambda msg: self.notify(msg) if msg else None)
 
     def action_resume_review(self) -> None:
         from .tui_control import ResumeScreen
