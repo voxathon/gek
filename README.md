@@ -156,6 +156,7 @@ the TUI and any other client use the same channel, so every action is on the rec
 | `gek pause` / `gek unpause` | freeze and unfreeze the swarm; agents finish their current step and wait |
 | `gek kill AGENT [REASON]` / `gek halt [REASON]` | kill one agent / stop the swarm |
 | `gek inbox "message"` | a plain message to the orchestrator |
+| `gek mcp set NAME 'JSON'` / `gek mcp rm NAME` / `gek mcp enable\|disable NAME` | add, replace, remove or park an `mcp_servers` entry, live or from the CLI for the next run |
 
 Live settings take effect without a restart, are saved to the swarm's `config.json`, and show up
 in the orchestrator's next briefing. Editing `config.json` by hand while the swarm runs works too.
@@ -322,12 +323,30 @@ Inside the sandbox:
 
 Agents and the orchestrator are told in their prompts whether shells are sandboxed.
 
-MCP servers are configured in `mcp_servers` (stdio only for now):
+MCP servers are configured in `mcp_servers` — stdio (a command) or remote (a url):
 
 ```json
-"mcp_servers": { "fetch": { "command": "uvx", "args": ["mcp-server-fetch"], "env": {} } },
-"ceiling": { "mcp": { "fetch": ["*"] } }
+"mcp_servers": {
+  "shell":  {"command": "uvx", "args": ["mcp-server-fetch"]},
+  "linear": {"url": "https://mcp.example.com/mcp", "transport": "streamable-http",
+             "headers": {"Authorization": "Bearer ${ENV:MCP_TOKEN}"}}
+},
+"ceiling": { "mcp": { "shell": ["*"], "linear": ["*"] } }
 ```
+
+Rules: exactly one of `command` | `url` per entry — both or neither is a clear ValueError
+naming the server. A remote entry's `transport` is `streamable-http` (the default) or `sse`.
+Header values are `${ENV:NAME}` placeholders: secrets never live in config.json, they are
+expanded at connect time and are never logged or shown — logs and the UI carry the endpoint
+host and transport, and header *names* only. A server that is unreachable or missing its
+variable contributes no tools and the agent keeps running. `_`-prefixed keys are treated as
+comments.
+
+Manage them either live over the audited control plane or offline for the next run:
+`gek mcp set NAME '{"url": "...", "transport": "streamable-http", "headers": {...}}'`,
+`gek mcp rm NAME`, `gek mcp enable NAME`, `gek mcp disable NAME`. Remote entries are managed
+that way only — the TUI edits stdio servers. Full schema and troubleshooting:
+[docs/MCP.md](docs/MCP.md).
 
 **One tool path.** Every tool an agent sees comes from a *source*: `gek` (the core tools,
 gated by powers), an MCP server, or a plugin that provides tools. `powers.mcp` (also spelled
