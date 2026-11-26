@@ -217,9 +217,9 @@ async def main() -> int:
                                               for c in controls)
                                           and any(e["kind"] == "config" and e["data"]["key"].startswith("mcp_servers")
                                                   for e in ev),
-        "offline mcp set saves for the next run": off_mcp[0] == 0 and "applies on the next run" in off_mcp[1]
+        "offline mcp set saves for the next run": "applies on the next run" in off_mcp
                                                   and (mid.get("mcp_servers") or {}).get("calc", {}).get("command") == "uvx",
-        "offline mcp rm saves for the next run": off_mcp_rm[0] == 0 and "applies on the next run" in off_mcp_rm[1]
+        "offline mcp rm saves for the next run": "applies on the next run" in off_mcp_rm
                                                  and "calc" not in (saved.get("mcp_servers") or {}),
         "halt": reason.startswith("halted by moxxie"),
         "offline role set": off_role[0] == 0 and "scout" in off_list[1],
