@@ -62,12 +62,8 @@ class MCPBridge:
             # raises ValueError (naming server + variable, never a value) if a var is missing
             headers = mcp_resolve_headers(spec, base_env, name=server)
             timeout = float(spec.get("timeout_s") or 60)
-            if transport == "sse":
-                from mcp.client.sse import sse_client  # noqa: PLC0415
-
-                streams = await server_stack.enter_async_context(
-                    sse_client(url, headers=headers, timeout=timeout))
-                return streams[0], streams[1]
+            # both remote transports go through an owner task: the SDK transports enter an
+            # anyio cancel scope, and only the task that entered one may exit it
             return await self._open_remote(server, url, transport, headers, timeout)
 
         from mcp import StdioServerParameters  # noqa: PLC0415
@@ -113,16 +109,23 @@ class MCPBridge:
         entered it. A setup error goes back through holder (ready is always set)."""
         stack = AsyncExitStack()
         try:
-            import httpx2  # noqa: PLC0415 -- the SDK's own http lib, same version
-            from mcp.client.streamable_http import (create_mcp_http_client,  # noqa: PLC0415
-                                                    streamable_http_client)
+            if transport == "sse":
+                from mcp.client.sse import sse_client  # noqa: PLC0415
 
-            # the httpx client must stay open for the whole session: the same task enters both
-            http_client = await stack.enter_async_context(
-                create_mcp_http_client(headers=headers, timeout=httpx2.Timeout(timeout)))
-            streams = await stack.enter_async_context(
-                streamable_http_client(url, http_client=http_client))
-            holder["read"], holder["write"] = streams[0], streams[1]
+                streams = await stack.enter_async_context(
+                    sse_client(url, headers=headers, timeout=timeout))
+                holder["read"], holder["write"] = streams[0], streams[1]
+            else:
+                import httpx2  # noqa: PLC0415 -- the SDK's own http lib, same version
+                from mcp.client.streamable_http import (create_mcp_http_client,  # noqa: PLC0415
+                                                        streamable_http_client)
+
+                # the httpx client must stay open for the whole session: this same task enters both
+                http_client = await stack.enter_async_context(
+                    create_mcp_http_client(headers=headers, timeout=httpx2.Timeout(timeout)))
+                streams = await stack.enter_async_context(
+                    streamable_http_client(url, http_client=http_client))
+                holder["read"], holder["write"] = streams[0], streams[1]
         except BaseException as e:
             holder["error"] = e
         ready.set()
