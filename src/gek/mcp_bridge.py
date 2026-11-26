@@ -14,6 +14,7 @@ never shown to it.
 from __future__ import annotations
 
 import anyio
+import asyncio
 import json
 import os
 from contextlib import AsyncExitStack
@@ -39,6 +40,12 @@ class MCPBridge:
         self.actor = actor
         self.log = log
         self.stack = AsyncExitStack()
+        # Remote transports: the task that entered their contexts owns them, because anyio
+        # refuses to exit a cancel scope from a task other than the one that entered it, and
+        # close() is not guaranteed to run in the task that ran connect().
+        self.owner_tasks: dict[str, asyncio.Task] = {}
+        self.owner_stops: dict[str, asyncio.Event] = {}
+        self.owner_transports: dict[str, str] = {}
         self.sessions: dict[str, Any] = {}
         self.tools: dict[str, tuple[str, str]] = {}  # exposed name -> (server, tool)
         self.listed: list[Tool] = []
@@ -60,18 +67,8 @@ class MCPBridge:
 
                 streams = await server_stack.enter_async_context(
                     sse_client(url, headers=headers, timeout=timeout))
-            else:
-                import httpx2  # noqa: PLC0415 -- the SDK's own http lib, same version
-                from mcp.client.streamable_http import (create_mcp_http_client,  # noqa: PLC0415
-                                                        streamable_http_client)
-
-                # the httpx client must stay open for the whole session: nest it on the same
-                # stack scope as the transport (both closed by server_stack, in one task)
-                http_client = await server_stack.enter_async_context(
-                    create_mcp_http_client(headers=headers, timeout=httpx2.Timeout(timeout)))
-                streams = await server_stack.enter_async_context(
-                    streamable_http_client(url, http_client=http_client))
-            return streams[0], streams[1]
+                return streams[0], streams[1]
+            return await self._open_remote(server, url, transport, headers, timeout)
 
         from mcp import StdioServerParameters  # noqa: PLC0415
         from mcp.client.stdio import stdio_client  # noqa: PLC0415
@@ -82,6 +79,79 @@ class MCPBridge:
         read, write = await server_stack.enter_async_context(
             stdio_client(params, errlog=self.log.stderr_file(f"mcp-{server}-{self.actor}")))
         return read, write
+
+    async def _open_remote(self, server: str, url: str, transport: str,
+                           headers: dict[str, str], timeout: float):
+        """Enter a remote transport in a task of its own and hand its (read, write) back.
+
+        The SDK's streamable-http transport enters an anyio cancel scope, and anyio only lets
+        the task that entered a scope exit it. connect() and close() are not guaranteed to run
+        in the same task, so the owner task below enters the contexts (httpx client first, then
+        the transport) and stays alive until told to stop; only then does it close its stack."""
+        ready, stop, holder = asyncio.Event(), asyncio.Event(), {}
+        task = asyncio.create_task(
+            self._own(server, url, transport, headers, timeout, ready, stop, holder))
+        self.owner_tasks[server] = task
+        self.owner_stops[server] = stop
+        self.owner_transports[server] = transport
+        try:
+            await asyncio.wait_for(ready.wait(), timeout)
+        except BaseException:
+            await self._stop_owner(server, quiet=True)
+            raise
+        error = holder.get("error")
+        if error is not None:
+            await self._stop_owner(server, quiet=True)
+            raise error
+        return holder["read"], holder["write"]
+
+    async def _own(self, server: str, url: str, transport: str, headers: dict[str, str],
+                   timeout: float, ready: asyncio.Event, stop: asyncio.Event,
+                   holder: dict[str, Any]) -> None:
+        """The owner task body: enter the remote transport's contexts, publish the streams,
+        wait for stop, then close the stack here so every cancel scope exits in the task that
+        entered it. A setup error goes back through holder (ready is always set)."""
+        stack = AsyncExitStack()
+        try:
+            import httpx2  # noqa: PLC0415 -- the SDK's own http lib, same version
+            from mcp.client.streamable_http import (create_mcp_http_client,  # noqa: PLC0415
+                                                    streamable_http_client)
+
+            # the httpx client must stay open for the whole session: the same task enters both
+            http_client = await stack.enter_async_context(
+                create_mcp_http_client(headers=headers, timeout=httpx2.Timeout(timeout)))
+            streams = await stack.enter_async_context(
+                streamable_http_client(url, http_client=http_client))
+            holder["read"], holder["write"] = streams[0], streams[1]
+        except BaseException as e:
+            holder["error"] = e
+        ready.set()
+        if "error" in holder:
+            try:
+                await stack.aclose()
+            except BaseException:
+                pass
+            return
+        await stop.wait()
+        await stack.aclose()  # in this task: the task that entered the scopes
+
+    async def _stop_owner(self, server: str, quiet: bool = False) -> None:
+        """Tell a remote owner task to close its transport stack and wait for it, so the stack
+        is exited inside that task (which is what anyio requires)."""
+        stop = self.owner_stops.pop(server, None)
+        task = self.owner_tasks.pop(server, None)
+        transport = self.owner_transports.pop(server, "remote")
+        if stop is not None:
+            stop.set()
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(task, 15)
+        except BaseException as e:
+            if not quiet and not isinstance(e, asyncio.CancelledError):
+                # server + transport only: an error text can quote a url or a header value
+                self.log.event("mcp", self.actor, server=server, transport=transport,
+                               closing=True, error=f"{type(e).__name__}")
 
     async def connect(self, grants: dict[str, list[str]], servers: dict[str, Any],
                       base_env: dict[str, str] | None = None) -> None:
@@ -137,6 +207,7 @@ class MCPBridge:
                     event["transport"] = mcp_transport(spec)
                     event["host"] = _host(mcp_endpoint(spec))
                 self.log.event("mcp", self.actor, **event)
+                await self._stop_owner(server, quiet=True)
                 try:
                     await server_stack.aclose()
                 except BaseException:
@@ -176,6 +247,12 @@ class MCPBridge:
         return ("ERROR: " + out) if err else out
 
     async def close(self) -> None:
+        """Close every transport in the task that opened it: a remote transport's contexts are
+        exited by its owner task (anyio forbids exiting a cancel scope from another task), the
+        stdio transports and the sessions by this one. A teardown error is logged once per
+        server, by name and transport only: never a header value, never a url path."""
+        for server in list(self.owner_tasks):
+            await self._stop_owner(server)
         try:
             await self.stack.aclose()
         except BaseException as e:  # anyio cancel scopes can be fussy on teardown
