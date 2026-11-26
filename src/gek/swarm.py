@@ -17,9 +17,9 @@ from .config import Config
 from .gitrepo import CHATTER, INBOX, MAIN, ROLES, Identity, Repo
 from .llm import LLM, BudgetExceeded
 from .logs import RunLog
-from .prompts import ORCHESTRATOR_PRIOR
-from .config import (flatten, get_path, is_hot, mcp_edit, mcp_entry, mcp_servers, parse_value,
-                       persist_key, set_path)
+from .prompts import orchestrator_prior
+from .config import (flatten, get_path, global_config_path, is_hot, mcp_edit, mcp_entry,
+                       mcp_servers, parse_value, persist_key, set_path)
 from .roles import Role, validate
 from .tools import B, I, S, ToolBox, arr, obj
 
@@ -97,10 +97,18 @@ class Swarm:
         return not self.resumed.is_set()
 
     def _mtime(self) -> float:
+        """Newest config file this swarm reads: its own, and for a home swarm the shared
+        GEK_HOME/config.json, so a global edit reaches _reload_config_file like a hand edit."""
         try:
-            return self.cfg.path.stat().st_mtime
+            mtime = self.cfg.path.stat().st_mtime
         except OSError:
-            return 0.0
+            mtime = 0.0
+        if not self.cfg.portable:
+            try:
+                mtime = max(mtime, global_config_path().stat().st_mtime)
+            except OSError:
+                pass
+        return mtime
 
     async def apply_config(self, key: str, value: Any, author: str, persist: bool = True) -> str:
         """Change one live setting. Returns a result line; raises ValueError when refused."""
@@ -384,7 +392,7 @@ class Swarm:
 
         notes = env_notes_text(self.cfg)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": ORCHESTRATOR_PRIOR},
+            {"role": "system", "content": orchestrator_prior(self.cfg)},
             {"role": "user", "content": (
                 f"Wake #{self.wakes} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}. "
                 f"Why you woke: {', '.join(reasons)}.\n\n"

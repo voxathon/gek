@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from .roles import Role
 
 ORCHESTRATOR_PRIOR = """\
@@ -69,8 +72,24 @@ future-you. Call `halt` only when the goal is done or cannot be done.
 """
 
 
+def orchestrator_prior(cfg: Any = None) -> str:
+    """The orchestrator's system prompt: prompts.orchestrator_prior when set, else the built-in.
+
+    cfg is a Config (its merged .raw is used) or a config dict; None gives the built-in.
+    """
+    raw = getattr(cfg, "raw", cfg)
+    custom = ""
+    if isinstance(raw, Mapping):
+        section = raw.get("prompts")
+        if isinstance(section, Mapping):
+            custom = str(section.get("orchestrator_prior") or "").strip()
+    return custom or ORCHESTRATOR_PRIOR
+
+
 def agent_system(role: Role, agent_id: str, branch: str, goal: str, limits: str = "",
-                 env_notes: str = "") -> str:
+                 env_notes: str = "", extra: str = "") -> str:
+    """The agent's system prompt. `extra` (config prompts.agents_extra) is appended last, in its
+    own section; empty or blank `extra` leaves the prompt byte-identical to the built-in one."""
     p = role.powers
     powers = []
     if p.shell:
@@ -83,6 +102,8 @@ def agent_system(role: Role, agent_id: str, branch: str, goal: str, limits: str 
         powers.append(f"kill agents of roles: {', '.join(p.kill)}")
     for server, globs in p.mcp.items():
         powers.append(f"MCP server {server} (tools: {', '.join(globs)})")
+    note = str(extra or "").strip()
+    tail = ("Project-specific instructions:" + chr(10) + note + chr(10)) if note else ""
     return f"""\
 You are {agent_id}, an agent in an asynchronous swarm. You were spawned into the
 role "{role.name}" by an orchestrator you cannot talk to directly.
@@ -118,4 +139,4 @@ You'll see a [gek: ...] status line now and then with how much you have used. Wh
 close to a limit, commit what you have and finish with a handoff summary; at the limit you are
 stopped, and anything uncommitted is lost.
 {('Notes about this environment:' + chr(10) + env_notes) if env_notes else ''}
-"""
+""" + tail

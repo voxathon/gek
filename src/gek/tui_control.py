@@ -1,12 +1,18 @@
-"""Control-plane screens for `gek tui`: new swarm, spawn, push, roles editor, config table.
+"""Control-plane screens for `gek tui`: new swarm, spawn, push, roles editor, config table,
+the global config editor and the prompt editor.
 
 Everything goes through the same paths as the CLI (cli.do_control, init_home_swarm,
-push_swarm, start_detached), so the TUI can't do anything the protocol doesn't record.
+push_swarm, start_detached), so the TUI can't do anything the protocol doesn't record. The one
+exception is the global config editor (G): it writes gek_home()/config.json directly, because
+routing a shared setting through the control plane would persist it into the swarm's own file
+and shadow the global value forever.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -536,6 +542,372 @@ class PluginsScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         event.stop()
         self.action_edit()
+
+
+# --------------------------------------------------------------- global config
+# `gek_home()/config.json` is the *global* layer: every swarm under this gek home merges it
+# under its own config.json (config.load_config). Nothing in the TUI could see or write it
+# before: ConfigScreen shows the *merged* view and writes the swarm's own file. So this screen
+# lists only the leaves this file itself sets. A merged row would be a lie here: you can edit it
+# (it becomes a swarm override) but you could never unset it, because the value you see came
+# from the defaults or from another file.
+#
+# It must never go through do_control: the control plane's `config set` ends up in
+# config.apply_config, which persists into the *swarm's* config.json (swarm.py). Doing that for
+# a global setting would shadow the global value forever. Global writes are
+# config.persist_key(gek_home()/"config.json", key, value); nothing here needs a running swarm.
+GLOBAL_MISSING = object()
+
+
+def _global_path() -> Path:
+    from .config import gek_home
+
+    return gek_home() / "config.json"
+
+
+def _load_global() -> dict:
+    """The global config file's own keys: never the defaults, never the merged view."""
+    p = _global_path()
+    if not p.exists():
+        return {}
+    data = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{p} is not a JSON object")
+    return data
+
+
+def _delete_path(raw: dict, key: str) -> bool:
+    """Drop one dotted key from a config dict; True if it was there. persist_key cannot delete."""
+    parts = key.split(".")
+    node: Any = raw
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or not isinstance(node.get(part), dict):
+            return False
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        return False
+    del node[parts[-1]]
+    return True
+
+
+def _dotted_key(text: str) -> str:
+    key = (text or "").strip()
+    if not key or any(not p.strip() for p in key.split(".")):
+        raise ValueError("a dotted key like agents.max_alive or models.default")
+    return key
+
+
+class GlobalConfigScreen(Screen):
+    """The settings shared by every swarm under this gek home: what gek_home()/config.json sets.
+
+    Rows are that file's leaves only, so every row can be edited, and deleted back to the
+    default. Cold keys (api.*, swarm_dir) are read once at start-up: they are editable here and
+    tagged "restart" instead of refused.
+    """
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "back"),
+        Binding("enter", "edit", "edit"),
+        Binding("e", "edit", "edit", show=False),
+        Binding("a", "new", "add"),
+        Binding("x", "remove", "remove"),
+        Binding("r", "reload", "reload"),
+    ]
+    CSS = """
+    #gc-note { height: auto; padding: 0 1; }
+    #gc-detail { height: auto; max-height: 6; padding: 0 1; background: $boost; }
+    """
+
+    def __init__(self, cfg: Config | None = None):
+        super().__init__()
+        self.cfg = cfg  # the swarm being viewed, only to point at the file this screen doesn't edit
+        self.leaves: dict[str, Any] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(id="gc-note")
+        yield DataTable(id="gc-table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="gc-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#gc-table", DataTable).add_columns("setting", "value", "applies")
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        t = self.query_one("#gc-table", DataTable)
+        keep = t.cursor_row
+        t.clear()
+        broken = ""
+        try:
+            self.leaves = flatten(_load_global())
+        except (OSError, ValueError) as e:
+            self.leaves, broken = {}, f"can't read the file: {e}"
+        for k, v in sorted(self.leaves.items()):
+            tag = Text("live", style="green") if is_hot(k) else Text("restart", style="dim")
+            val = json.dumps(v)
+            t.add_row(k, val if len(val) <= 70 else val[:67] + "...", tag, key=k)
+        if t.row_count:
+            t.move_cursor(row=min(keep, t.row_count - 1))
+        p = _global_path()
+        note = Text.assemble(
+            ("Global config", "bold"),
+            "  |  ",
+            (str(p), "bold"),
+            ("" if p.exists() else "  (no such file yet: a adds the first key)"),
+            "  |  every swarm under this gek home merges this under its own config.json"
+            "  |  enter/e: edit, a: add, x: delete, r: reload")
+        if broken:
+            note.append("\n" + broken, style="red")
+        self.query_one("#gc-note", Static).update(note)
+        self._detail()
+
+    def _selected(self) -> str | None:
+        t = self.query_one("#gc-table", DataTable)
+        if not t.row_count:
+            return None
+        return str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+
+    def _detail(self) -> None:
+        box = self.query_one("#gc-detail", Static)
+        key = self._selected()
+        if not key:
+            box.update(Text("this file sets nothing: every swarm under this gek home runs on the "
+                            "built-in defaults. a adds a key (say models.default), and every swarm "
+                            "picks it up unless its own config.json sets it too.", style="dim"))
+            return
+        out = Text()
+        out.append(key, style="bold")
+        out.append(f" = {json.dumps(self.leaves.get(key))}\n")
+        if is_hot(key):
+            out.append("live: no restart needed. A run started after this edit gets it, and a "
+                       "running swarm re-reads its config while it runs.\n", style="green")
+        else:
+            out.append("restart: read once at start-up, so the swarm has to be restarted for it.\n",
+                       style="yellow")
+        if self.cfg is not None:
+            out.append(f"a swarm's own config.json wins over this one; c edits "
+                       f"{self.cfg.name}'s own file, G (here) the shared one.", style="dim")
+        box.update(out)
+
+    def _set_global(self, key: str, value: Any) -> str:
+        from .config import persist_key, write_home_defaults
+
+        p = _global_path()
+        if not p.exists():
+            write_home_defaults()  # bootstrap the file (and .env) the way `gek init` does
+        persist_key(p, key, value)  # one key, every other key in the file kept
+        self.refresh_table()
+        return f"{key} = {json.dumps(value)[:60]} in {p}"
+
+    def _del_global(self, key: str) -> str:
+        p = _global_path()
+        raw = _load_global()
+        if not _delete_path(raw, key):
+            raise ValueError(f"{key} is not in {p}")
+        p.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        self.refresh_table()
+        return f"{key} removed from {p}: the built-in default applies again"
+
+    def action_edit(self) -> None:
+        from .tui import PromptScreen
+
+        key = self._selected()
+        if not key:
+            return
+        current = json.dumps(self.leaves.get(key))
+        tag = "live" if is_hot(key) else "restart: read at start-up"
+        title = f"global {key} ({tag})  (JSON: 3, true, \"text\", [..], {{..}}). Enter saves, Esc cancels:"
+
+        def done(value: str | None) -> None:
+            if value is None or value.strip() == current:
+                return
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value  # treat as plain text, exactly like ConfigScreen.action_edit
+            try:
+                self.notify(self._set_global(key, parsed))
+            except Exception as e:  # unwritable home, JSON errors: show, don't crash
+                self.notify(str(e), severity="error")
+
+        self.app.push_screen(PromptScreen(title, value=current), done)
+
+    def action_new(self) -> None:
+        from .config import get_path, parse_value, set_path
+        from .tui import PromptScreen
+
+        def named(value: str | None) -> None:
+            if value is None:
+                return
+            try:
+                key = _dotted_key(value)
+                probe: dict[str, Any] = {}
+                set_path(probe, key, 1)  # a key must round-trip through the dotted path
+                if get_path(probe, key) != 1:
+                    raise ValueError(f"{key} does not round-trip through a dotted path")
+            except ValueError as e:
+                self.notify(str(e), severity="error")
+                return
+            have = json.dumps(self.leaves[key]) if key in self.leaves else ""
+
+            def valued(text: str | None) -> None:
+                if text is None or not text.strip():
+                    return
+                try:
+                    self.notify(self._set_global(key, parse_value(text.strip())))
+                except Exception as e:
+                    self.notify(str(e), severity="error")
+
+            self.app.push_screen(
+                PromptScreen(f"{key} (JSON: 3, true, \"text\", [..], {{..}}). Enter saves, Esc cancels:",
+                             value=have), valued)
+
+        self.app.push_screen(
+            PromptScreen("New global setting, dotted (e.g. models.default, agents.max_alive):"), named)
+
+    def action_remove(self) -> None:
+        key = self._selected()
+        if not key:
+            return
+        try:
+            self.notify(self._del_global(key))
+        except Exception as e:
+            self.notify(str(e), severity="error")
+
+    def action_reload(self) -> None:
+        self.refresh_table()
+        self.notify(f"re-read {_global_path()}")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._detail()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        event.stop()
+        self.action_edit()
+
+
+# --------------------------------------------------------------------- prompts
+# Two settings, both hot, both per swarm: prompts.orchestrator_prior (empty = the built-in
+# prior in prompts.py) and prompts.agents_extra (empty = no extra text). Saving goes through
+# do_control exactly like every other TUI edit, so it is an audited control commit when the
+# swarm runs and a config.json write when it doesn't. G is the other half: the shared settings.
+PROMPT_KEYS = ("prompts.orchestrator_prior", "prompts.agents_extra")
+PROMPT_HELP = {
+    "prompts.orchestrator_prior": "the orchestrator's standing instructions; empty = the built-in prior",
+    "prompts.agents_extra": "extra text appended to every agent's system prompt; empty = none",
+}
+
+
+class PromptsScreen(Screen):
+    """Edit the prompt text this swarm uses: pick a key, edit the box, ctrl+s saves."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "back"),
+        Binding("ctrl+s", "save", "save"),
+    ]
+    CSS = """
+    #pr-list { width: 26; border-right: solid $primary-darken-2; }
+    #pr-note { height: auto; padding: 0 1; }
+    .-narrow #pr-list { width: 14; }
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.key = PROMPT_KEYS[0]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield ListView(id="pr-list")
+            with Vertical(id="pr-edit"):
+                yield TextArea(id="pr-text")
+                yield Static(id="pr-note")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        lv = self.query_one("#pr-list", ListView)
+        for k in PROMPT_KEYS:
+            item = ListItem(Label(k.split(".", 1)[1]))
+            item.prompt_key = k  # type: ignore[attr-defined]
+            await lv.append(item)
+        lv.index = 0
+        self.query_one("#pr-text", TextArea).text = self._shown()
+        self.query_one("#pr-text", TextArea).focus()  # typing goes into the text, not the list
+        self._note()
+
+    def _stored(self, key: str) -> str:
+        from .config import get_path
+
+        v = get_path(self.cfg.raw, key)
+        return v if isinstance(v, str) else ""
+
+    def _shown(self) -> str:
+        """The override, or the built-in text when there is none (editing it overrides it)."""
+        from .prompts import ORCHESTRATOR_PRIOR
+
+        stored = self._stored(self.key)
+        if stored:
+            return stored
+        return ORCHESTRATOR_PRIOR if self.key == "prompts.orchestrator_prior" else ""
+
+    async def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        key = getattr(event.item, "prompt_key", None)
+        if key and key != self.key:
+            self.key = key
+            self.query_one("#pr-text", TextArea).text = self._shown()
+        self._note()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        event.stop()
+        self.query_one("#pr-text", TextArea).focus()  # picked a key: now edit its text
+
+    def _live(self) -> bool:
+        from .cli import is_running
+
+        return is_running(self.cfg)
+
+    def _note(self) -> None:
+        stored = self._stored(self.key)
+        if not stored and self.key == "prompts.orchestrator_prior":
+            state = ("nothing is set: the box shows the built-in prior. Edit it and ctrl+s to "
+                     "override it for this swarm.")
+        elif not stored:
+            state = "nothing is set: no agent gets extra text. Type and ctrl+s to add."
+        else:
+            state = (f"this swarm overrides it ({len(stored)} characters). ctrl+s saves the box; "
+                     "clear it and ctrl+s to fall back to the built-in.")
+        out = Text.assemble(
+            (self.key, "bold"), "\n",
+            (PROMPT_HELP[self.key], "dim"), "\n", state, "\n",
+            "file: ", (str(self.cfg.path), "bold"),
+            "  (prompts are per swarm; G is the shared settings file under your gek home)\n",
+            ("a running swarm applies this within a few seconds: the next orchestrator wake and "
+             "agents spawned after it" if self._live()
+             else "not running, so this is saved for the next run"),
+            ",  the list picks the key (click it, or tab to it), ctrl+s: save, esc: back")
+        self.query_one("#pr-note", Static).update(out)
+
+    def action_save(self) -> None:
+        # The commit has to outlive this screen (see McpScreen._edit): run it on the App.
+        self.app.run_worker(self._save())
+
+    async def _save(self) -> None:
+        from .cli import do_control
+
+        key = self.key
+        text = self.query_one("#pr-text", TextArea).text
+        try:
+            msg = await do_control(self.cfg, WHO, f"config set {key}", "edited from the TUI",
+                                   json.dumps(text))
+        except Exception as e:
+            self.notify(str(e), severity="error")
+            return
+        self.notify(msg)
+        if not self._live():
+            self.cfg = _reload(self.cfg)  # offline it is on disk already, so show it as stored
+            self._note()
 
 
 # ------------------------------------------------------------------- mcp servers

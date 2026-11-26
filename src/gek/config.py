@@ -104,6 +104,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "plugins": {
         "_comment": "name -> its config; only plugins named here load. Bundled: notify (see README).",
     },
+    "prompts": {
+        "_comment": "Extra prompt text, empty by default (the built-in prompts are used). "
+                    "orchestrator_prior replaces the orchestrator's system prompt; "
+                    "agents_extra is appended to every agent's system prompt. Live: edits apply "
+                    "on the next orchestrator wake / agent start.",
+        "orchestrator_prior": "",
+        "agents_extra": "",
+    },
 }
 
 
@@ -595,7 +603,7 @@ GEK_API_KEY=put-your-key-here
 HOT_PREFIXES = (
     "goal", "budget.", "ceiling.", "ceiling", "models.default", "models.orchestrator",
     "models.aliases", "models.pricing", "mcp_servers", "llm.temperature", "llm.timeout_s",
-    "llm.num_retries", "llm.extra_params", "agents.", "orchestrator.",
+    "llm.num_retries", "llm.extra_params", "agents.", "orchestrator.", "prompts.",
 )
 COLD_PREFIXES = ("swarm_dir", "api")
 
@@ -656,3 +664,49 @@ def persist_key(path: Path, key: str, value: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
+
+
+# ----------------------------------------------------------------- global file
+# The shared layer: GEK_HOME/config.json, layered under every home swarm's own config.json
+# (load_config). Editing it changes every swarm that does not override the key, so the TUI's
+# global config editor reads and writes exactly this file -- never through the control plane
+# (`config set` persists into the swarm's own config.json and would shadow the global value).
+def global_config_path() -> Path:
+    """The shared config file: GEK_HOME/config.json."""
+    return gek_home() / "config.json"
+
+
+def load_global_config() -> dict[str, Any]:
+    """The shared config file's contents as-is; {} when it is missing or unreadable."""
+    try:
+        with open(global_config_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def persist_global_key(key: str, value: Any) -> None:
+    """Write one key into GEK_HOME/config.json, creating it first when absent."""
+    path = global_config_path()
+    if not path.exists():
+        write_home_defaults()
+    persist_key(path, key, value)
+
+
+def delete_path(raw: dict[str, Any], key: str) -> dict[str, Any]:
+    """A copy of raw without the leaf `key`; parents left empty by the removal are pruned."""
+    out = json.loads(json.dumps(raw))
+    parts = key.split(".")
+    node: Any = out
+    trail: list[tuple[dict[str, Any], str]] = []
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or not isinstance(node.get(part), dict):
+            return out
+        trail.append((node, part))
+        node = node[part]
+    node.pop(parts[-1], None)
+    for parent, part in reversed(trail):
+        if parent.get(part) == {}:
+            parent.pop(part, None)
+    return out

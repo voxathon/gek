@@ -469,8 +469,11 @@ class Agent:
             if compact_at > 0:
                 limits += (f"; past ~{compact_at:,} prompt tokens your older history is replaced by notes "
                            "you write, so commit often and keep your chatter posts informative")
+            # prompts.agents_extra: extra system text for every agent, appended after the rest
+            extra = str(sw.cfg.section("prompts").get("agents_extra") or "").strip()
             self._record({"role": "system", "content": agent_system(
-                h.role, h.id, h.branch, sw.goal, limits=limits, env_notes=env_notes_text(sw.cfg))})
+                h.role, h.id, h.branch, sw.goal, limits=limits, env_notes=env_notes_text(sw.cfg),
+                extra=extra)})
             chatter = await sw.repo.log_text([CHATTER], limit=30, max_chars=8000)
             mainlog = await sw.repo.log_text([MAIN], limit=10, max_chars=3000)
             self._record({"role": "user", "content": (

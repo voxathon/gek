@@ -3,7 +3,8 @@ live run, a finished one, or one from four months ago.
 
 Keys: up/down pick a swarm, [ and ] step through runs, Enter on an agent opens its
 transcript (f full/short, s system prompt, esc back), i sends an inbox message, k kills the
-selected agent, H halts the swarm, q quits.
+selected agent, H halts the swarm, c edits the swarm's config, G edits the global config shared
+by every swarm under your gek home, S edits the swarm's prompts, q quits.
 """
 
 from __future__ import annotations
@@ -583,6 +584,8 @@ class GekTUI(App):
         Binding("L", "plugins", "plugins"),
         Binding("M", "mcp", "mcp"),
         Binding("U", "resume_review", "resume"),
+        Binding("G", "global_config", "global"),
+        Binding("S", "prompts", "prompts"),
     ]
 
     # -------------------------------------------------- control plane
@@ -605,6 +608,8 @@ class GekTUI(App):
             ("Switch mode", "llm <-> human orchestration", self.action_mode_toggle),
             ("Roles", "view and edit role templates", self.action_roles),
             ("Config", "view and change settings live", self.action_config),
+            ("Global config", "settings for every swarm under your gek home", self.action_global_config),
+            ("Prompts", "edit the prompt text used by this swarm", self.action_prompts),
             ("Push", "push swarm work to a git remote", self.action_push),
             ("Plugins", "installed vs enabled plugins; enable, disable, edit their config", self.action_plugins),
             ("MCP servers", "view, add, enable/disable MCP servers live", self.action_mcp),
@@ -731,6 +736,18 @@ class GekTUI(App):
 
         if self.cfg is not None:
             self.push_screen(ConfigScreen(self.cfg))
+
+    def action_global_config(self) -> None:
+        from .tui_control import GlobalConfigScreen
+
+        # works without a swarm selected: the global file belongs to the gek home, not to a swarm
+        self.push_screen(GlobalConfigScreen(self.cfg))
+
+    def action_prompts(self) -> None:
+        from .tui_control import PromptsScreen
+
+        if self.cfg is not None:
+            self.push_screen(PromptsScreen(self.cfg))
 
     def action_wake(self) -> None:
         if self.cfg is not None:
