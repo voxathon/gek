@@ -91,7 +91,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mcp": {},
     },
     "mcp_servers": {
-        "_comment": "name -> {command, args, env}. Grant them to roles via ceiling.mcp.",
+        "_comment": "name -> {command, args, env, cwd, timeout_s, enabled}. Grant them to "
+                    "roles via ceiling.mcp. Live: edits apply to a running swarm (agents "
+                    "reconnect between steps). Never put secrets here.",
     },
     "plugins": {
         "_comment": "name -> its config; only plugins named here load. Bundled: notify (see README).",
@@ -204,14 +206,128 @@ class Config:
         return kw
 
     def redacted(self) -> dict[str, Any]:
-        """Config as logged: config.json never holds secrets, but env names are noted."""
+        """Config as logged/displayed: config.json never holds secrets, but env names are noted.
+        MCP server `env` values are masked (display only; self.raw keeps them)."""
         api = self.raw.get("api", {})
         return {
             **self.raw,
+            "mcp_servers": redact_mcp(self.raw.get("mcp_servers")),
             "_env_present": {
                 v: bool(os.environ.get(v)) for v in api.values() if isinstance(v, str)
             },
         }
+
+
+# ------------------------------------------------------------- mcp servers
+# mcp_servers = {name: {command, args, env, cwd, timeout_s, enabled}}; `_`-prefixed keys are
+# comments (see write_default_config). Every entry is hot: it is applied to a running swarm and
+# live agents reconnect their MCP bridge between steps. Never put secrets in config.json: env
+# values are redacted for display/logs (redacted()), names stay.
+MCP_FIELDS = ("command", "args", "env", "cwd", "timeout_s", "enabled")
+MCP_ACTIONS = ("set", "rm", "enable", "disable")
+
+
+def mcp_names(servers: Any) -> list[str]:
+    """Server names in config order, `_`-prefixed comment keys removed."""
+    return [str(k) for k in (servers or {}) if not str(k).startswith("_")]
+
+
+def mcp_entry(spec: Any) -> dict[str, Any]:
+    """One server's normalized entry (defaults filled in). enabled defaults to True."""
+    spec = spec if isinstance(spec, dict) else {}
+    out: dict[str, Any] = {}
+    if spec.get("command"):
+        out["command"] = str(spec["command"])
+    if spec.get("args"):
+        out["args"] = [str(a) for a in spec["args"]]
+    if spec.get("env"):
+        out["env"] = {str(k): str(v) for k, v in spec["env"].items()}
+    if spec.get("cwd"):
+        out["cwd"] = str(spec["cwd"])
+    if spec.get("timeout_s"):
+        out["timeout_s"] = int(spec["timeout_s"])
+    else:
+        out["timeout_s"] = 60
+    out["enabled"] = bool(spec.get("enabled", True))
+    return out
+
+
+def shape_mcp_entry(spec: Any, name: str = "") -> dict[str, Any]:
+    """Validate one mcp_servers entry; raises ValueError. stdio only (a command to launch)."""
+    label = f"mcp server {name!r}" if name else "mcp server"
+    if not isinstance(spec, dict):
+        raise ValueError(f"{label} must be an object like "
+                         '{"command": "npx", "args": ["-y", "some-server"]}')
+    if spec.get("url") and not spec.get("command"):
+        raise ValueError(f"{label}: url/http servers aren't supported yet; give a command (stdio)")
+    unknown = [k for k in spec if str(k) not in MCP_FIELDS and k != "url"]
+    if unknown:
+        raise ValueError(f"{label}: unknown field(s) {', '.join(map(str, unknown))}; "
+                         f"allowed: {', '.join(MCP_FIELDS)} (stdio: command+args)")
+    if not str(spec.get("command") or "").strip():
+        raise ValueError(f"{label} needs a command (the program to launch, e.g. npx)")
+    out = mcp_entry(spec)
+    if not isinstance(spec.get("args", []), list):
+        raise ValueError(f"{label}: args must be a list of strings")
+    if not isinstance(spec.get("env", {}), dict):
+        raise ValueError(f"{label}: env must be an object of NAME -> value")
+    try:
+        out["timeout_s"] = int(out["timeout_s"])
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}: timeout_s must be a whole number of seconds")
+    if out["timeout_s"] <= 0:
+        raise ValueError(f"{label}: timeout_s must be positive")
+    out["enabled"] = bool(spec.get("enabled", True))
+    return out
+
+
+def mcp_servers(raw: Any, only_enabled: bool = True) -> dict[str, Any]:
+    """The servers a bridge should connect to (enabled ones by default)."""
+    out = {}
+    for name in mcp_names(raw):
+        spec = (raw or {}).get(name)
+        if not isinstance(spec, dict):
+            continue
+        if only_enabled and not spec.get("enabled", True):
+            continue
+        out[name] = spec
+    return out
+
+
+def mcp_edit(raw_servers: Any, action: str, name: str, entry: Any = None) -> dict[str, Any]:
+    """Return a NEW mcp_servers dict with one change applied (used by `mcp set|rm|enable|disable`).
+
+    Keeps `_`-prefixed comment keys and every other server untouched, so this can be persisted
+    as a whole with persist_key(path, "mcp_servers", result)."""
+    if not NAME_OK.match(str(name or "")):
+        raise ValueError(f"{name!r} isn't a valid server name (letters, digits, _.-; "
+                         "no dots-only/comment names)")
+    cur = dict(raw_servers or {})
+    action = (action or "").strip()
+    if action not in MCP_ACTIONS:
+        raise ValueError(f"mcp {action or '?'}: use one of {', '.join(MCP_ACTIONS)}")
+    if action == "set":
+        cur[name] = shape_mcp_entry(entry, name)
+        return cur
+    if name not in cur or str(name).startswith("_"):
+        raise ValueError(f"no mcp server {name!r} in mcp_servers")
+    if action == "rm":
+        del cur[name]
+    else:
+        spec = cur[name] if isinstance(cur[name], dict) else {"command": ""}
+        cur[name] = {**spec, "enabled": action == "enable"}
+    return cur
+
+
+def redact_mcp(servers: Any) -> dict[str, Any]:
+    """A copy of mcp_servers with env VALUES masked (names kept) for display and logs."""
+    out: dict[str, Any] = {}
+    for name, spec in (servers or {}).items():
+        if isinstance(spec, dict) and isinstance(spec.get("env"), dict):
+            out[name] = {**spec, "env": {str(k): "***" for k in spec["env"]}}
+        else:
+            out[name] = spec
+    return out
 
 
 def _read_json(p: Path) -> dict[str, Any]:
