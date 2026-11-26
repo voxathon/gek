@@ -817,8 +817,8 @@ class McpScreen(Screen):
             if name:
                 self.app.call_after_refresh(lambda: self._edit(name, {}))
 
-        self.push_screen(PromptScreen("Name for the new MCP server (e.g. files), Enter to configure:"),
-                         done)
+        self.app.push_screen(PromptScreen("Name for the new MCP server (e.g. files), Enter to configure:"),
+                             done)
 
     def _edit(self, name: str, spec: dict) -> None:
         def done(res) -> None:
