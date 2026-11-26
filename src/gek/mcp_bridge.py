@@ -108,13 +108,12 @@ class MCPBridge:
         wait for stop, then close the stack here so every cancel scope exits in the task that
         entered it. A setup error goes back through holder (ready is always set)."""
         stack = AsyncExitStack()
+        cm = None
         try:
             if transport == "sse":
                 from mcp.client.sse import sse_client  # noqa: PLC0415
 
-                streams = await stack.enter_async_context(
-                    sse_client(url, headers=headers, timeout=timeout))
-                holder["read"], holder["write"] = streams[0], streams[1]
+                cm = sse_client(url, headers=headers, timeout=timeout)
             else:
                 import httpx2  # noqa: PLC0415 -- the SDK's own http lib, same version
                 from mcp.client.streamable_http import (create_mcp_http_client,  # noqa: PLC0415
@@ -123,10 +122,20 @@ class MCPBridge:
                 # the httpx client must stay open for the whole session: this same task enters both
                 http_client = await stack.enter_async_context(
                     create_mcp_http_client(headers=headers, timeout=httpx2.Timeout(timeout)))
-                streams = await stack.enter_async_context(
-                    streamable_http_client(url, http_client=http_client))
-                holder["read"], holder["write"] = streams[0], streams[1]
+                cm = streamable_http_client(url, http_client=http_client)
+            streams = await stack.enter_async_context(cm)
+            cm = None  # the stack owns it now and exits it in this task
+            holder["read"], holder["write"] = streams[0], streams[1]
         except BaseException as e:
+            # A transport whose __aenter__ failed is already a started async generator that the
+            # stack never took ownership of; left to the garbage collector it is finalized by
+            # another task, which anyio refuses (the "cancel scope in a different task" error).
+            # Close it here, in the task that started it.
+            if cm is not None:
+                try:
+                    await cm.aclose()  # type: ignore[attr-defined]
+                except BaseException:
+                    pass
             holder["error"] = e
         ready.set()
         if "error" in holder:
