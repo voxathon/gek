@@ -1,11 +1,13 @@
-"""Control-plane screens for `gek tui`: new swarm, spawn, push, roles editor, config table,
-the global config editor and the prompt editor.
+"""Control-plane screens for `gek tui`: new swarm, spawn, push, roles editor, the swarm's config
+editor (c), the global config editor (G) and the prompt editor.
 
 Everything goes through the same paths as the CLI (cli.do_control, init_home_swarm,
-push_swarm, start_detached), so the TUI can't do anything the protocol doesn't record. The one
-exception is the global config editor (G): it writes gek_home()/config.json directly, because
-routing a shared setting through the control plane would persist it into the swarm's own file
-and shadow the global value forever.
+push_swarm, start_detached), so the TUI can't do anything the protocol doesn't record. The
+exceptions write config files directly: the global config editor (G) writes
+gek_home()/config.json, because routing a shared setting through the control plane would persist
+it into the swarm's own file and shadow the global value forever; and the swarm's config editor
+(c) writes restart-only keys and deletes overrides in the swarm's config.json, which the control
+plane has no verb for (a running swarm sees the file change like a hand edit).
 """
 
 from __future__ import annotations
@@ -299,74 +301,230 @@ class RolesScreen(Screen):
 
 
 class ConfigScreen(Screen):
-    """Every setting; Enter on a live one edits it (applied without restarting)."""
+    """This swarm's settings, with the same controls as the global editor (G): edit, add, delete.
 
-    BINDINGS = [Binding("escape", "app.pop_screen", "back"), Binding("enter", "edit", "edit")]
+    Rows are the *merged* view, so every setting the swarm runs on is visible, and the "from"
+    column says which layer each value comes from: this swarm's config.json, the global file, or
+    the built-in default. Writes always land in this swarm's own file:
+      - a live key goes through cli.do_control, exactly as before (a control commit while the swarm
+        runs, a config.json write when it doesn't);
+      - a restart key (api.*, swarm_dir) is written to config.json directly and applies next run;
+      - x deletes the swarm's own override, so the global or default value applies again. Only
+        rows "from swarm" can be deleted: the others aren't in this file. A running swarm sees the
+        file change and applies the inherited value like any hand edit of config.json.
+    """
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "back"),
+        Binding("enter", "edit", "edit"),
+        Binding("e", "edit", "edit", show=False),
+        Binding("a", "new", "add"),
+        Binding("x", "remove", "remove"),
+        Binding("r", "reload", "reload"),
+    ]
+    CSS = """
+    #c-note { height: auto; padding: 0 1; }
+    #c-detail { height: auto; max-height: 7; padding: 0 1; background: $boost; }
+    """
 
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
+        self.merged: dict[str, Any] = {}
+        self.own: dict[str, Any] = {}      # leaves this swarm's config.json sets
+        self.shared: dict[str, Any] = {}   # leaves the global file sets (none for a portable swarm)
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(id="c-note")
         yield DataTable(id="c-table", cursor_type="row", zebra_stripes=True)
+        yield Static(id="c-detail")
         yield Footer()
 
     def on_mount(self) -> None:
         t = self.query_one("#c-table", DataTable)
-        t.add_columns("setting", "value", "")
+        t.add_columns("setting", "value", "from", "applies")
         self.refresh_table()
+
+    def _source(self, key: str) -> str:
+        if key in self.own:
+            return "swarm"
+        if key in self.shared:
+            return "global"
+        return "default"
 
     def refresh_table(self) -> None:
         from .cli import is_running
 
-        self.cfg = _reload(self.cfg)
+        broken = ""
+        try:
+            self.cfg = _reload(self.cfg)
+            self.own = flatten(_read_obj(self.cfg.path))
+            self.shared = {} if self.cfg.portable else flatten(_load_global())
+        except (OSError, ValueError) as e:
+            broken = f"can't read the config: {e}"
+        self.merged = flatten(self.cfg.raw)
         t = self.query_one("#c-table", DataTable)
         keep = t.cursor_row
         t.clear()
-        for k, v in sorted(flatten(self.cfg.raw).items()):
+        for k, v in sorted(self.merged.items()):
+            src = self._source(k)
+            src_t = Text(src, style={"swarm": "bold", "global": "cyan", "default": "dim"}[src])
             tag = Text("live", style="green") if is_hot(k) else Text("restart", style="dim")
             val = json.dumps(v)
-            t.add_row(k, val if len(val) <= 80 else val[:77] + "...", tag, key=k)
+            t.add_row(k, val if len(val) <= 70 else val[:67] + "...", src_t, tag, key=k)
         if t.row_count:
             t.move_cursor(row=min(keep, t.row_count - 1))
-        self.query_one("#c-note", Static).update(
-            f"{self.cfg.name}: {'running, changes apply now' if is_running(self.cfg) else 'not running, changes apply next run'}"
-            f"  |  file: {self.cfg.path}")
+        state = "running, live changes apply now" if is_running(self.cfg) else "not running, changes apply next run"
+        note = Text.assemble(
+            (f"{self.cfg.name}", "bold"), f": {state}  |  ", (str(self.cfg.path), "bold"),
+            f"  |  {len(self.own)} set here",
+            ("" if self.cfg.portable else f", {len(self.shared)} from the global file (G)"),
+            "  |  enter/e: edit, a: add, x: delete (back to global/default), r: reload")
+        if broken:
+            note.append("\n" + broken, style="red")
+        self.query_one("#c-note", Static).update(note)
+        self._detail()
+
+    def _selected(self) -> str | None:
+        t = self.query_one("#c-table", DataTable)
+        if not t.row_count:
+            return None
+        return str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
+
+    def _inherited(self, key: str) -> tuple[str, Any]:
+        """What this key would be without the swarm's own override."""
+        if key in self.shared:
+            return "global", self.shared[key]
+        from .config import DEFAULT_CONFIG
+
+        d = flatten(DEFAULT_CONFIG)
+        return ("default", d[key]) if key in d else ("nothing", None)
+
+    def _detail(self) -> None:
+        box = self.query_one("#c-detail", Static)
+        key = self._selected()
+        if not key:
+            box.update(Text("no settings. a adds one to this swarm's config.json.", style="dim"))
+            return
+        out = Text()
+        out.append(key, style="bold")
+        out.append(f" = {json.dumps(self.merged.get(key))}\n")
+        if is_hot(key):
+            out.append("live: no restart needed; a running swarm applies it at once.\n", style="green")
+        else:
+            out.append("restart: read once at start-up; saved to config.json, applies next run.\n",
+                       style="yellow")
+        src = self._source(key)
+        if src == "swarm":
+            where, val = self._inherited(key)
+            back = (f"x drops it and {where} {json.dumps(val)[:50]} applies again" if where != "nothing"
+                    else "x drops it (nothing else sets this key)")
+            out.append(f"set in this swarm's config.json; {back}.", style="dim")
+        elif src == "global":
+            out.append("from the global file, shared by every swarm (G edits it there). Editing here "
+                       "overrides it for this swarm only.", style="dim")
+        else:
+            out.append("the built-in default. Editing here sets it for this swarm only; G sets it "
+                       "for every swarm.", style="dim")
+        box.update(out)
+
+    async def _set(self, key: str, value: Any) -> str:
+        """Live keys through the control plane (as before); restart keys straight into config.json."""
+        from .cli import do_control
+        from .config import persist_key
+
+        if is_hot(key):
+            return await do_control(self.cfg, WHO, f"config set {key}", "set from the TUI", json.dumps(value))
+        persist_key(self.cfg.path, key, value)
+        return f"{key} = {json.dumps(value)[:60]} saved; it's a restart setting, so it applies next run"
+
+    async def _apply(self, key: str, value: Any) -> None:
+        try:
+            self.notify(await self._set(key, value))
+        except Exception as e:  # refused live key, unwritable file: show, don't crash
+            self.notify(str(e), severity="error")
+        self.set_timer(1.5 if is_hot(key) else 0.1, self.refresh_table)
 
     def action_edit(self) -> None:
         from .tui import PromptScreen
 
-        t = self.query_one("#c-table", DataTable)
-        if not t.row_count:
+        key = self._selected()
+        if not key:
             return
-        key = str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value)
-        if not is_hot(key):
-            self.notify(f"{key} needs a restart: edit {self.cfg.path}", severity="warning")
-            return
-        from .config import get_path
-
-        current = json.dumps(get_path(self.cfg.raw, key))
+        current = json.dumps(self.merged.get(key))
+        tag = "live" if is_hot(key) else "restart: applies next run"
         warn = "  CEILING: this changes what the swarm may grant." if key.startswith("ceiling") else ""
-        title = f"{key} (JSON: 3, true, \"text\", [..], {{..}}).{warn} Enter saves, Esc cancels:"
+        title = f"{key} ({tag}) (JSON: 3, true, \"text\", [..], {{..}}).{warn} Enter saves, Esc cancels:"
 
         async def done(value: str | None) -> None:
-            from .cli import do_control
+            from .config import parse_value
 
             if value is None or value.strip() == current:
                 return
-            try:
-                json.loads(value)
-            except json.JSONDecodeError:
-                value = json.dumps(value)  # treat as plain text
-            try:
-                self.notify(await do_control(self.cfg, WHO, f"config set {key}", "set from the TUI", value))
-            except Exception as e:
-                self.notify(str(e), severity="error")
-            self.set_timer(1.5, self.refresh_table)
+            await self._apply(key, parse_value(value.strip()))
 
         self.app.push_screen(PromptScreen(title, value=current), done)
+
+    def action_new(self) -> None:
+        from .config import get_path, parse_value, set_path
+        from .tui import PromptScreen
+
+        def named(value: str | None) -> None:
+            if value is None:
+                return
+            try:
+                key = _dotted_key(value)
+                probe: dict[str, Any] = {}
+                set_path(probe, key, 1)  # a key must round-trip through the dotted path
+                if get_path(probe, key) != 1:
+                    raise ValueError(f"{key} does not round-trip through a dotted path")
+            except ValueError as e:
+                self.notify(str(e), severity="error")
+                return
+            have = json.dumps(self.merged[key]) if key in self.merged else ""
+
+            async def valued(text: str | None) -> None:
+                if text is None or not text.strip():
+                    return
+                await self._apply(key, parse_value(text.strip()))
+
+            self.app.push_screen(
+                PromptScreen(f"{key} for {self.cfg.name} (JSON: 3, true, \"text\", [..], {{..}}). "
+                             "Enter saves, Esc cancels:", value=have), valued)
+
+        self.app.push_screen(
+            PromptScreen(f"New setting for {self.cfg.name}, dotted (e.g. models.default, agents.max_alive):"),
+            named)
+
+    def action_remove(self) -> None:
+        key = self._selected()
+        if not key:
+            return
+        if key not in self.own:
+            where = "the global file (G removes it there)" if key in self.shared else "the built-in defaults"
+            self.notify(f"{key} isn't set in this swarm's config.json: it comes from {where}",
+                        severity="warning")
+            return
+        try:
+            data = _read_obj(self.cfg.path)
+            if not _delete_path(data, key):
+                raise ValueError(f"{key} is not in {self.cfg.path}")
+            self.cfg.path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except Exception as e:
+            self.notify(str(e), severity="error")
+            return
+        where, val = self._inherited(key)
+        self.notify(f"{key} removed from {self.cfg.path.name}: "
+                    + (f"{where} {json.dumps(val)[:50]} applies again" if where != "nothing" else "unset"))
+        self.refresh_table()
+
+    def action_reload(self) -> None:
+        self.refresh_table()
+        self.notify(f"re-read {self.cfg.path}")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._detail()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         event.stop()
@@ -565,15 +723,19 @@ def _global_path() -> Path:
     return gek_home() / "config.json"
 
 
-def _load_global() -> dict:
-    """The global config file's own keys: never the defaults, never the merged view."""
-    p = _global_path()
+def _read_obj(p: Path) -> dict:
+    """A config file's own keys (a missing file sets nothing)."""
     if not p.exists():
         return {}
     data = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{p} is not a JSON object")
     return data
+
+
+def _load_global() -> dict:
+    """The global config file's own keys: never the defaults, never the merged view."""
+    return _read_obj(_global_path())
 
 
 def _delete_path(raw: dict, key: str) -> bool:
@@ -587,6 +749,15 @@ def _delete_path(raw: dict, key: str) -> bool:
     if not isinstance(node, dict) or parts[-1] not in node:
         return False
     del node[parts[-1]]
+    # drop parents the delete left empty: an empty {} would otherwise sit in the file as a leaf
+    for depth in range(len(parts) - 1, 0, -1):
+        parent: Any = raw
+        for part in parts[:depth - 1]:
+            parent = parent[part]
+        if parent[parts[depth - 1]] == {}:
+            del parent[parts[depth - 1]]
+        else:
+            break
     return True
 
 

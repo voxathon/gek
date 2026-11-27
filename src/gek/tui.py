@@ -1,7 +1,8 @@
 """`gek tui`: watch swarms. Reads the run logs (events.jsonl) directly, so it works on a
 live run, a finished one, or one from four months ago.
 
-Keys: up/down pick a swarm, [ and ] step through runs, Enter on an agent opens its
+Keys: up/down pick a swarm, [ and ] step through runs (a run and the `--resume`s that
+continue it show as one), Enter on an agent opens its
 transcript (f full/short, s system prompt, esc back), i sends an inbox message, k kills the
 selected agent, H halts the swarm, c edits the swarm's config, G edits the global config shared
 by every swarm under your gek home, S edits the swarm's prompts, q quits.
@@ -46,14 +47,22 @@ class AgentRow:
     last_prompt: int = 0      # size of its latest prompt, what compaction looks at
     compactions: int = 0
     tools: dict = field(default_factory=dict)  # source -> [tool names], from its `tools` event
+    run_dir: Path | None = None  # the run directory it was last seen in (where its transcript is)
+
+
+RESUME_COLOR = "magenta"
 
 
 @dataclass
 class RunData:
-    """Incrementally parsed events.jsonl for one run."""
+    """Incrementally parsed events.jsonl for one run, or for a chain of runs where each one
+    `--resume`s the one before. A chain reads as one continuous run: agents, tokens, wakes and
+    the feed carry across, the idle time between segments is cut out of the time axis, and each
+    resume is marked. `path` is always the newest segment's events.jsonl (the one that may be
+    live); `segments` lists them all, oldest first."""
 
     path: Path
-    offset: int = 0
+    segments: list[Path] = field(default_factory=list)
     t0: float | None = None
     t_last: float | None = None
     ended: str | None = None
@@ -81,31 +90,54 @@ class RunData:
     mcp: dict = field(default_factory=dict)            # server -> what this run's events say about it
     role_compact_at: dict = field(default_factory=dict)  # role -> compact_at, from role_written
     events: int = 0
-    _partial: str = ""
+    resume_list: list[tuple[float, str, str]] = field(default_factory=list)  # (t, run id, how the one before ended)
+    gaps: list[tuple[float, float]] = field(default_factory=list)  # (t a segment starts, idle seconds before it)
+    _offsets: dict = field(default_factory=dict)   # segment path -> bytes read
+    _partials: dict = field(default_factory=dict)  # segment path -> incomplete last line
+    _seg: int = -1                                 # index of the segment being ingested
+    _seg_seen: int = -1                            # highest segment that has produced an event
+    _wake_base: int = 0                            # wakes in earlier segments (wake numbers restart per run)
+
+    def __post_init__(self) -> None:
+        if not self.segments:
+            self.segments = [self.path]
+        self.path = self.segments[-1]
+
+    @property
+    def segment_dirs(self) -> list[Path]:
+        return [p.parent for p in self.segments]
+
+    def rel(self, t: float) -> float:
+        """Seconds since the chain started, not counting the idle time between segments."""
+        if self.t0 is None:
+            return 0.0
+        return t - self.t0 - sum(g for at, g in self.gaps if at <= t)
 
     def poll(self) -> bool:
-        """Read new lines. Returns True if anything changed."""
-        try:
-            with open(self.path, encoding="utf-8") as f:
-                f.seek(self.offset)
-                chunk = f.read()
-                self.offset = f.tell()
-        except OSError:
-            return False
-        if not chunk:
-            return False
-        data = self._partial + chunk
-        lines = data.split("\n")
-        self._partial = lines.pop()  # incomplete last line, if any
+        """Read new lines from every segment (only the newest one can still grow). Returns True if
+        anything changed."""
         changed = False
-        for line in lines:
-            if not line.strip():
-                continue
+        for i, seg in enumerate(self.segments):
             try:
-                self._ingest(json.loads(line))
-                changed = True
-            except Exception:
+                with open(seg, encoding="utf-8") as f:
+                    f.seek(self._offsets.get(seg, 0))
+                    chunk = f.read()
+                    self._offsets[seg] = f.tell()
+            except OSError:
                 continue
+            if not chunk:
+                continue
+            lines = (self._partials.get(seg, "") + chunk).split("\n")
+            self._partials[seg] = lines.pop()  # incomplete last line, if any
+            self._seg = i
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    self._ingest(json.loads(line))
+                    changed = True
+                except Exception:
+                    continue
         return changed
 
     def _agent(self, aid: str) -> AgentRow:
@@ -114,17 +146,45 @@ class RunData:
             a = self.agents[aid] = AgentRow(id=aid, role=aid.split("/")[0])
             if aid == "orchestrator":
                 a.status = "-"
+        if 0 <= self._seg < len(self.segments):
+            a.run_dir = self.segments[self._seg].parent
         return a
+
+    def _segment_starts(self, t: float) -> None:
+        """The first event of a resumed segment: close the one before it."""
+        name = self.segments[self._seg].parent.name
+        prev = self.segments[self._seg - 1].parent.name if self._seg > 0 else "?"
+        how = " ".join((self.ended or "crashed, no run_end").split())
+        if self.t_last is not None and t > self.t_last:
+            self.gaps.append((t, t - self.t_last))
+        self.resume_list.append((t, name, how))
+        stranded = [a for a in self.agents.values() if a.status == "alive"]
+        for a in stranded:  # alive when the run before stopped: their branches survive, they don't
+            a.status = "interrupted"
+        if self.alive:
+            self.alive = 0
+            self.alive_series.append((t, 0))
+        self.ended = None
+        self.paused = False
+        self._wake_base = self.wakes
+        line = (f"{time.strftime('%H:%M:%S', time.localtime(t))} -- resumed: run {name} picks up {prev} "
+                f"({how}" + (f"; {len(stranded)} agents interrupted" if stranded else "") + ") --")
+        self.feed.append(line)
+        self.new_feed.append(line)
 
     def _ingest(self, e: dict[str, Any]) -> None:
         k, actor, d, t = e["kind"], e.get("actor", ""), e.get("data", {}), e["t"]
+        if self._seg > self._seg_seen:
+            if self._seg_seen >= 0:
+                self._segment_starts(t)
+            self._seg_seen = self._seg
         if self.t0 is None:
             self.t0 = t
             self.alive_series.append((t, 0))
         self.t_last = t
         self.events += 1
         if k == "run_start":
-            self.goal = d.get("goal", "")
+            self.goal = d.get("goal", "") or self.goal
         elif k == "run_end":
             self.ended = d.get("reason", "?")
         elif k == "mode":
@@ -132,7 +192,7 @@ class RunData:
         elif k == "pause":
             self.paused = bool(d.get("paused"))
         elif k == "orch_wake":
-            self.wakes = d.get("n", self.wakes + 1)
+            self.wakes = self._wake_base + int(d.get("n") or (self.wakes - self._wake_base + 1))
             self.wake_list.append((t, self.wakes, ", ".join(d.get("reasons") or []) or "?"))
         elif k == "llm_response":
             u = d.get("usage") or {}
@@ -222,6 +282,61 @@ def runs_of(cfg: Config) -> list[Path]:
     return list_runs(cfg.logs_dir)
 
 
+_PENDING = object()  # a run whose run_start isn't written yet: can't tell whether it resumes anything
+_parents: dict[Path, str | None] = {}  # run dir -> the run it resumes (None = a fresh run); settled ones only
+
+
+def resume_parent(run_dir: Path) -> Any:
+    """The run id that `run_dir` resumes (from its run_start event), None for a fresh run, or
+    _PENDING if it hasn't written run_start yet."""
+    if run_dir in _parents:
+        return _parents[run_dir]
+    try:
+        with open(run_dir / "events.jsonl", encoding="utf-8") as f:
+            for n, line in enumerate(f):
+                if n >= 200:
+                    break
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("kind") == "run_start":
+                    parent = ((e.get("data") or {}).get("resume") or {}).get("run") or None
+                    _parents[run_dir] = parent
+                    return parent
+    except OSError:
+        pass
+    return _PENDING
+
+
+def chains_of(runs: list[Path]) -> tuple[list[list[Path]], bool]:
+    """Group runs (oldest first) into chains: a run that resumes the newest run of a chain
+    continues that chain; anything else starts a new one. Returns the chains, oldest first, and
+    whether any run is still pending (no run_start yet, so it may join a chain later)."""
+    chains: list[list[Path]] = []
+    tip: dict[str, int] = {}  # run id at the end of a chain -> its index
+    pending = False
+    for r in runs:
+        parent = resume_parent(r)
+        if parent is _PENDING:
+            pending = True
+            try:
+                st = (r / "events.jsonl").stat()
+                if st.st_size == 0 and time.time() - st.st_mtime < 60:
+                    continue  # just created, run_start is moments away: place it once it says what it resumes
+            except OSError:
+                continue
+            parent = None
+        i = tip.pop(parent, None) if parent else None
+        if i is None:
+            chains.append([r])
+            i = len(chains) - 1
+        else:
+            chains[i].append(r)
+        tip[r.name] = i
+    return chains, pending
+
+
 def running_run(cfg: Config) -> str | None:
     lock = cfg.swarm_dir / "run.lock"
     try:
@@ -232,7 +347,7 @@ def running_run(cfg: Config) -> str | None:
 
 # ------------------------------------------------------------------- widgets
 def _mins(run: RunData, t: float) -> float:
-    return round((t - (run.t0 or t)) / 60.0, 3)
+    return round(run.rel(t) / 60.0, 3)
 
 
 WAKE_COLOR = "orange"
@@ -242,8 +357,14 @@ COMPACT_COLOR = "cyan"
 def _wake_lines(plt, run: RunData, as_minute_index: bool = False) -> None:
     """Orchestrator wakes as vertical lines, so you can see what each wake set off."""
     for t, _, _ in run.wake_list:
-        x = int((t - (run.t0 or t)) // 60) if as_minute_index else _mins(run, t)
+        x = int(run.rel(t) // 60) if as_minute_index else _mins(run, t)
         plt.vline(x, WAKE_COLOR)
+
+
+def _resume_lines(plt, run: RunData) -> None:
+    """Where a resumed run picked up the one before it (the idle time between is cut out)."""
+    for t, _, _ in run.resume_list:
+        plt.vline(_mins(run, t), RESUME_COLOR)
 
 
 class TokensPlot(PlotextPlot):
@@ -259,6 +380,7 @@ class TokensPlot(PlotextPlot):
                 pts.append((run.view_end, pts[-1][1], pts[-1][2]))  # flat until now
             xs = [_mins(run, t) for t, _, _ in pts]
             _wake_lines(plt, run)
+            _resume_lines(plt, run)
             for ct, *_ in run.compaction_list:  # each compaction: does the slope flatten after it?
                 plt.vline(_mins(run, ct), COMPACT_COLOR)
             plt.plot(xs, [n / 1000 for _, n, _ in pts], label="total", marker="braille")
@@ -272,7 +394,8 @@ class AlivePlot(PlotextPlot):
         plt = self.plt
         plt.clear_data()
         plt.clear_figure()
-        plt.title("live agents")
+        # the resume legend lives here: the tokens title is already as long as a narrow panel allows
+        plt.title("live agents" + ("   magenta | resume" if run and run.resume_list else ""))
         plt.xlabel("minutes")
         if run and run.alive_series:
             xs, ys = [], []
@@ -289,6 +412,7 @@ class AlivePlot(PlotextPlot):
             xs.append(_mins(run, end))
             ys.append(prev or 0)
             _wake_lines(plt, run)
+            _resume_lines(plt, run)
             plt.plot(xs, ys, marker="braille")
             top = max(ys + [1]) + 1
             plt.ylim(0, top)
@@ -305,10 +429,10 @@ class CommitsPlot(PlotextPlot):
         plt.xlabel("minute")
         if run and run.t0 is not None and (run.commits or run.t_last):
             end = run.view_end or run.t_last or run.t0
-            nmin = int((end - run.t0) // 60) + 1
+            nmin = int(run.rel(end) // 60) + 1
             buckets = [0] * nmin
             for t in run.commits:
-                i = int((t - run.t0) // 60)
+                i = int(run.rel(t) // 60)
                 if 0 <= i < nmin:
                     buckets[i] += 1
             plt.bar(list(range(nmin)), buckets, marker="sd")
@@ -363,11 +487,15 @@ class TranscriptScreen(Screen):
     #t-log { height: 1fr; }
     """
 
-    def __init__(self, path: Path, actor: str, run: RunData, cfg: Config | None):
+    def __init__(self, path: Path | list[Path], actor: str, run: RunData, cfg: Config | None):
         super().__init__()
-        self._path, self._actor, self._run, self._cfg = path, actor, run, cfg
-        self._off = 0
-        self._part = ""
+        # several paths = the same actor across a chain of resumed runs, oldest first
+        self._paths = list(path) if isinstance(path, (list, tuple)) else [path]
+        self._path = self._paths[-1]
+        self._actor, self._run, self._cfg = actor, run, cfg
+        self._offs: dict[Path, int] = {}
+        self._parts: dict[Path, str] = {}
+        self._started: set[Path] = set()
         self._msgs: list[dict[str, Any]] = []
         self._full = False
         self._show_sys = False
@@ -385,22 +513,28 @@ class TranscriptScreen(Screen):
         self.set_interval(TICK_S, self._tick)
 
     def _read_new(self) -> list[dict[str, Any]]:
-        try:
-            with open(self._path, encoding="utf-8") as f:
-                f.seek(self._off)
-                chunk = f.read()
-                self._off = f.tell()
-        except OSError:
-            return []
-        lines = (self._part + chunk).split("\n")
-        self._part = lines.pop()
         new = []
-        for line in lines:
-            if line.strip():
-                try:
-                    new.append(json.loads(line))
-                except Exception:
-                    pass
+        for p in self._paths:
+            try:
+                with open(p, encoding="utf-8") as f:
+                    f.seek(self._offs.get(p, 0))
+                    chunk = f.read()
+                    self._offs[p] = f.tell()
+            except OSError:
+                continue
+            lines = (self._parts.get(p, "") + chunk).split("\n")
+            self._parts[p] = lines.pop()
+            for line in lines:
+                if line.strip():
+                    try:
+                        m = json.loads(line)
+                    except Exception:
+                        continue
+                    if p not in self._started:
+                        self._started.add(p)
+                        if len(self._started) > 1:  # a later run of the chain: mark where it resumed
+                            new.append({"_resumed": p.parent.parent.name})
+                    new.append(m)
         self._msgs.extend(new)
         return new
 
@@ -413,7 +547,8 @@ class TranscriptScreen(Screen):
         head.append(self._actor, style="bold")
         head.append("  " + stat + "\n")
         head.append(f"{len(self._msgs)} messages | {mode} | s: system prompt "
-                    f"{'shown' if self._show_sys else 'hidden'} | {self._path}", style="dim")
+                    f"{'shown' if self._show_sys else 'hidden'} | {self._path}"
+                    + (f" (+{len(self._paths) - 1} earlier runs)" if len(self._paths) > 1 else ""), style="dim")
         if a is not None and (a.compactions or a.last_prompt):
             head.append(f"\ncontext {a.last_prompt:,} tokens", style="dim")
             if a.compactions:
@@ -447,6 +582,10 @@ class TranscriptScreen(Screen):
             self._head()
 
     def _write(self, log: RichLog, m: dict[str, Any]) -> None:
+        if "_resumed" in m:
+            log.write(Rule(f"resumed in run {m['_resumed']}", style=RESUME_COLOR))
+            self._wake = None
+            return
         if "wake" in m and m["wake"] != self._wake:
             self._wake = m["wake"]
             log.write(Rule(f"wake #{self._wake}", style="dark_orange"))
@@ -836,7 +975,9 @@ class GekTUI(App):
         super().__init__()
         self.initial = initial
         self.cfg: Config | None = None
-        self.runs: list[Path] = []
+        self.run_dirs: list[Path] = []    # every run directory, oldest first
+        self.runs: list[list[Path]] = []  # those grouped into resume chains; [ and ] step through these
+        self._pending = False             # a run without run_start yet: it may still join a chain
         self.run_idx = -1
         self.follow_latest = True
         self.cur: RunData | None = None
@@ -911,9 +1052,32 @@ class GekTUI(App):
 
     def select_swarm(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.runs = runs_of(cfg)
+        self.run_dirs = runs_of(cfg)
+        self.runs, self._pending = chains_of(self.run_dirs)
         self.follow_latest = True
         self.open_run(len(self.runs) - 1)
+
+    def _refresh_runs(self) -> bool:
+        """Pick up new runs. A `--resume` doesn't add a chain, it lengthens one, so this compares
+        the chains, not just the count. Returns True if it reopened the view."""
+        dirs = runs_of(self.cfg)
+        if dirs == self.run_dirs and not self._pending:
+            return False
+        chains, self._pending = chains_of(dirs)
+        self.run_dirs = dirs
+        if chains == self.runs:
+            return False
+        old = self.runs[self.run_idx] if 0 <= self.run_idx < len(self.runs) else None
+        self.runs = chains
+        if self.follow_latest or old is None:
+            self.open_run(len(chains) - 1)
+            return True
+        idx = next((i for i, c in enumerate(chains) if c[0] == old[0]), min(self.run_idx, len(chains) - 1))
+        if chains[idx] != old:
+            self.open_run(idx)
+            return True
+        self.run_idx = idx
+        return False
 
     # --------------------------------------------------------------- runs
     def open_run(self, idx: int) -> None:
@@ -923,7 +1087,8 @@ class GekTUI(App):
         if not self.runs or idx < 0:
             self.cur = None
         else:
-            self.cur = RunData(self.runs[idx] / "events.jsonl")
+            self.cur = RunData(self.runs[idx][-1] / "events.jsonl",
+                               segments=[d / "events.jsonl" for d in self.runs[idx]])
             self.cur.poll()
             for line in self.cur.feed:
                 feed.write(Text(line))
@@ -944,12 +1109,8 @@ class GekTUI(App):
     def tick(self) -> None:
         if self.cfg is None:
             return
-        runs = runs_of(self.cfg)
-        if len(runs) != len(self.runs):
-            self.runs = runs
-            if self.follow_latest:
-                self.open_run(len(runs) - 1)
-                return
+        if self._refresh_runs():
+            return
         changed = self.cur.poll() if self.cur else False
         live = self.cur is not None and self.cur.ended is None and running_run(self.cfg) == self.cur.path.parent.name
         if changed or live:
@@ -985,13 +1146,16 @@ class GekTUI(App):
                 bad = sum(1 for p in run.plugins.values() if p.get("status") in ("disabled", "load error"))
                 status += f"  plugins {len(run.plugins)}" + (f" [red]({bad} failed)[/red]" if bad else "") + " [dim](L)[/dim]"
             end = time.time() if live else (run.t_last or 0)
-            mins = (end - (run.t0 or end)) / 60
+            mins = run.rel(end) / 60
             total_agents = sum(1 for a in run.agents if a != "orchestrator")
             cached_pct = f"{100 * run.cached / max(run.tokens, 1):.0f}% cached" if run.cached else "no cache data"
             goal = " ".join(run.goal.split())
             goal = goal if len(goal) <= 110 else goal[:107] + "..."
             stats.update(
-                f"[b]{escape(self.cfg.name)} [/b]| run {run.path.parent.name} ({self.run_idx + 1}/{len(self.runs)})  {status}\n"
+                f"[b]{escape(self.cfg.name)} [/b]| run {run.path.parent.name}"
+                + (f" [{RESUME_COLOR}](resumes {len(run.segments) - 1} earlier)[/{RESUME_COLOR}]"
+                   if len(run.segments) > 1 else "")
+                + f" ({self.run_idx + 1}/{len(self.runs)})  {status}\n"
                 f"{mins:.1f} min  wakes {run.wakes}  agents {run.alive} live / {total_agents} total  "
                 f"tokens {run.tokens:,} ({cached_pct})  cost ${run.cost:.4f}  commits {len(run.commits)}  "
                 f"merges {len(run.merges)}\n[dim]goal: {escape(goal)}[/dim]")
@@ -1006,7 +1170,7 @@ class GekTUI(App):
             line = Text("wakes: ", style="dim")
             shown = run.wake_list[-8:]
             for wt, n, why in shown:
-                m = (wt - (run.t0 or wt)) / 60
+                m = run.rel(wt) / 60
                 why = why if len(why) <= 48 else why[:45] + "..."
                 line.append(f"#{n} {m:.1f}m ", style="bold dark_orange")
                 line.append(why + "   ", style="dim")
@@ -1046,8 +1210,13 @@ class GekTUI(App):
         if event.data_table.id != "agents" or self.cur is None or event.row_key is None:
             return
         aid = str(event.row_key.value)
-        path = self.cur.path.parent / "agents" / (aid.replace("/", "__") + ".jsonl")
-        self.push_screen(TranscriptScreen(path, aid, self.cur, self.cfg))
+        name = aid.replace("/", "__") + ".jsonl"
+        # every run of the chain this actor talked in (the orchestrator talks in all of them)
+        paths = [d / "agents" / name for d in self.cur.segment_dirs if (d / "agents" / name).exists()]
+        if not paths:
+            a = self.cur.agents.get(aid)
+            paths = [((a.run_dir if a and a.run_dir else self.cur.path.parent) / "agents" / name)]
+        self.push_screen(TranscriptScreen(paths, aid, self.cur, self.cfg))
 
 
 def run_tui(initial: Config | None) -> None:
