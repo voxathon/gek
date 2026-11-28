@@ -77,6 +77,12 @@ class Swarm:
         self.resumed = asyncio.Event()  # cleared while paused; agents wait on it between steps
         self.resumed.set()
         self.outside: list[str] = []  # outside actions since the orchestrator's last wake
+        # Inbox commits this process made (agents, the orchestrator, plugins). post() already
+        # logged them and woke the orchestrator, so the watcher skips them: they are never read
+        # again, and never as a Control: command. The lock closes the race where the watcher's
+        # git log sees a commit before post() has recorded its sha.
+        self._own_inbox: set[str] = set()
+        self._inbox_lock = asyncio.Lock()
         self._cfg_mtime = self._mtime()
         # Bumped whenever mcp_servers (or the ceiling that gates it) changes. Agents hold the
         # value they connected at and reconnect their MCP bridge between steps when it moves,
@@ -176,7 +182,12 @@ class Swarm:
     # -------------------------------------------------------------- helpers
     async def post(self, ref: str, actor: str, message: str, trailers: dict[str, str] | None = None) -> str:
         text = _message(message, trailers)
-        sha = await self.repo.empty_commit(ref, text, Identity.for_actor(actor), actor=actor)
+        if ref == INBOX:
+            async with self._inbox_lock:
+                sha = await self.repo.empty_commit(ref, text, Identity.for_actor(actor), actor=actor)
+                self._own_inbox.add(sha)
+        else:
+            sha = await self.repo.empty_commit(ref, text, Identity.for_actor(actor), actor=actor)
         if ref == INBOX and actor != ORCH:
             self.log.event("inbox", actor, message=message, sha=sha)
             self.request_wake(f"inbox from {actor}")
@@ -463,7 +474,8 @@ class Swarm:
     async def _inbox_watch(self) -> None:
         """Watch swarm/inbox for commits from outside this process (gek inbox, gek kill/halt,
         the TUI, plugins in other processes). Plain messages wake the orchestrator; commits with
-        a `Control:` trailer are handled by the harness itself: `kill <agent>` or `halt`."""
+        a `Control:` trailer are handled by the harness itself: `kill <agent>` or `halt`.
+        Commits this process made through post() are skipped by sha, whoever they claim to be from."""
         poll = self.cfg.section("orchestrator").get("inbox_poll_s", 5)
         last = await self.repo.tip(INBOX)
         fmt = ("%H%x1f%an%x1f%(trailers:key=Control,valueonly,separator=%x2c)%x1f"
@@ -472,16 +484,20 @@ class Swarm:
             await asyncio.sleep(self.cfg.section("orchestrator").get("inbox_poll_s", poll))
             if self._mtime() != self._cfg_mtime:
                 await self._reload_config_file()
-            tip = await self.repo.tip(INBOX)
-            if not tip or tip == last:
-                continue
-            span = f"{last}..{tip}" if last else tip
-            out = await self.repo.git("log", "--reverse", f"--format={fmt}", span, check=False)
+            async with self._inbox_lock:  # no post() half-done: every own sha is recorded
+                tip = await self.repo.tip(INBOX)
+                if not tip or tip == last:
+                    continue
+                span = f"{last}..{tip}" if last else tip
+                out = await self.repo.git("log", "--reverse", f"--format={fmt}", span, check=False)
+                own, self._own_inbox = self._own_inbox, set()
             last = tip
             for rec in out.split("\x1e"):
                 if not rec.strip():
                     continue
                 sha, author, control, reason, subject, body = (rec.strip("\n").split("\x1f") + [""] * 6)[:6]
+                if sha in own:
+                    continue  # posted by this process: post() already logged it and woke us
                 if author in self.agents or author in (ORCH, "gek"):
                     continue  # in-process posts already woke us
                 control = control.strip()

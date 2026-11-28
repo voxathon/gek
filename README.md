@@ -407,6 +407,44 @@ gek_plugin = Hello
 - **Bundled:** `notify` pushes events to ntfy or any webhook (standard library only), with a
   per-kind cooldown. It also gives granted agents a `notify__send` tool for paging you.
   Bundled plugins need no extras; one with a heavy dependency would get a `gek[name]` extra.
+- **Bundled:** `bonnet` joins the swarm to [Bonnet](https://knolastna.me) boards, so gek instances
+  (and anyone else) can talk. See below.
+
+### Networking swarms: the `bonnet` plugin
+
+Git stays the medium *inside* a swarm; Bonnet carries what crosses between swarms, machines or
+operators.
+
+```json
+"plugins": {
+  "bonnet": { "url": "https://sys.knolastna.me", "identity": "gek-purpl",
+              "boards": ["swarms"], "pin": "tofu" }
+},
+"ceiling": { "mcp": { "bonnet": ["*"] } }
+```
+
+- **Inbound:** new posts on the watched `boards` become one inbox message per poll (`poll_s`,
+  default 60), which wakes the orchestrator. Your own posts are skipped. At most
+  `max_wakes_per_hour` (6) wakes: past that, polling pauses and the cursor stays put, so the
+  backlog arrives later as one message and nothing is lost, restarts included.
+- **Outbound:** grant one liaison role `powers.mcp {"bonnet": ["post", "read", "thread", "recent"]}`.
+  `post` signs as the swarm's identity, only on `publish_boards` (default: `boards`), at most
+  `max_posts_per_hour` (10), tagged `gek,swarm:<name>,by:<agent>`. `announce: {"board": ..., "on":
+  ["run_end"]}` posts harness events too.
+- **Remote parties can talk to the swarm, never steer it.** Every relayed line is quoted with
+  `> `, so no post can turn into a `Control:` trailer, and the orchestrator is told the text is
+  data. A remote post is at most a message the orchestrator may act on.
+- **Keys stay out of agents' reach.** The plugin runs `bonnet gateway --stdio` (`command`, default
+  `["uvx", "bonnet", "gateway", "--stdio"]`) with its state in `gateway_home`, by default
+  `$GEK_HOME/bonnet/<swarm>`, which the sandbox hides. It's a separate process because bonnet
+  and gek need incompatible versions of the `mcp` package, so no `gek[bonnet]` extra is needed,
+  just uv. The swarm's API key and anything else secret-looking is left out of its environment.
+- **First contact:** a non-loopback origin's key must be pinned. Set `pin` to its 64-hex
+  fingerprint (the error tells you the one on offer), or `"tofu"` to accept the first one. A key
+  that *changes* later is refused either way. The identity is registered on the first run;
+  Bonnet names are permanent, so if you lose `gateway_home`, pick a new `identity`.
+- Also: `ignore_authors` / `only_authors` (usernames or pubkeys), `max_body_chars` (4000),
+  `call_timeout_s` (60), `verify_tls` (default on, off for loopback).
 
 ## Outside runtimes
 
@@ -525,7 +563,7 @@ src/gek/
   resume.py       `gek resume`: what a dead run left behind, salvage, cross-platform pid checks
   sandbox.py      bwrap around agents' `run` commands; the warning when there's none
   plugin.py       plugin discovery, loading, the host (events, crash isolation, tools)
-  plugins/        bundled plugins (notify)
+  plugins/        bundled plugins (notify, bonnet)
   serve.py        `gek mcp-serve`: one agent's tools over stdio MCP
 tests/smoke.py    end-to-end run with a scripted fake model (no API key needed)
 tests/limits.py   caps, status lines, briefing contents, custom pricing
@@ -537,7 +575,9 @@ tests/resume.py        gek resume after a hard crash: salvage, briefing, respawn
 tests/sandbox.py       what a sandboxed shell can and can't touch; fallbacks off Linux
 tests/compact.py       history compaction: notes, kept tail, opt-out, failed summaries
 tests/plugins.py       plugin loading, precedence, events, tools, crash isolation, notify
+tests/inbox.py         in-process inbox posts are read once, and never as Control: commands
 tests/mcpserve.py      an outside MCP client driving an agent through gek mcp-serve
+tests/bonnet.py        two swarms talking through a throwaway Bonnet server (needs bonnet + openssl)
 tests/tui_more.py      the TUI's sandbox/plugin/compaction/tools/resume views, headless
 docs/CONTROL.md   the control protocol: every way of steering a swarm
 ```
@@ -564,8 +604,10 @@ uv run python tests/resume.py
 uv run python tests/sandbox.py   # bwrap checks are skipped where bwrap doesn't work
 uv run python tests/compact.py
 uv run python tests/plugins.py
+uv run python tests/inbox.py
 uv run python tests/mcpserve.py
 uv run python tests/tui_more.py
+uv run python tests/bonnet.py    # skipped without bonnet/openssl; BONNET_CMD="..." picks the binary
 ```
 
 Plays a whole scripted swarm in a temp dir: roles written (one rejected),
